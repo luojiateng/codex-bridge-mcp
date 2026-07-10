@@ -1,0 +1,7 @@
+node_modules/
+dist/
+data/bridge.db
+data/bridge.db-*
+data/runtime-scripts/*.ps1
+data/logs/
+.env
