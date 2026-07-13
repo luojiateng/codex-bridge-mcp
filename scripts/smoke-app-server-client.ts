@@ -147,6 +147,7 @@ assert.equal("effort" in (turnStartRequest?.params ?? {}), false);
 assert.equal("summary" in (turnStartRequest?.params ?? {}), false);
 assert.deepEqual(threadStartRequest?.params?.config, {});
 assert.match(String(threadStartRequest?.params?.developerInstructions), /Keep execution minimal/);
+assert.match(String(threadStartRequest?.params?.developerInstructions), /task orchestrator/);
 assert.match(String(threadStartRequest?.params?.developerInstructions), /Keep tool output economical/);
 assert.match(String(threadStartRequest?.params?.developerInstructions), /required JSON self-report/);
 assert.equal(clientMessages.some((message) => message.method === "thread/resume"), false);
