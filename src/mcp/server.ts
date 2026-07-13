@@ -35,7 +35,14 @@ export async function startMcpServer(): Promise<void> {
     config,
   );
   const compactService = new CompactService(store, runtimeHostManager, clientPool, logger);
-  const recoveryService = new RecoveryService(store, runtimeHostManager, clientPool, logger, config);
+  const recoveryService = new RecoveryService(
+    store,
+    runtimeHostManager,
+    clientPool,
+    logger,
+    config,
+    (task, runtime, client) => taskService.bindTaskRuntimeEvents(task, runtime, client),
+  );
 
   const server = new McpServer(
     {
@@ -47,6 +54,7 @@ export async function startMcpServer(): Promise<void> {
     },
   );
 
+  await taskService.waitForStartupRecovery();
   registerTools(server, taskService, compactService, recoveryService);
 
   const transport = new StdioServerTransport();

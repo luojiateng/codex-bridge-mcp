@@ -17,6 +17,9 @@ export function buildCodexDeveloperInstructions(): string {
     "7. When done, report only: changes, files, tests, and unfinished items.",
     "8. If Claude gives an exact file and exact textual edit, make that edit directly instead of running discovery commands.",
     "9. Do not run verification commands after simple deterministic edits unless Claude explicitly asks or the turn says checks are required.",
+    "10. Keep tool output economical: use focused searches, inspect summaries before full files, avoid duplicate reads, and run the smallest relevant check.",
+    "11. Do not print or repeat full logs, diffs, generated files, or command output unless the task specifically needs them; retain only decisive lines and failures.",
+    "12. At the end of every turn, create or overwrite the required JSON self-report. Its exact shape is {\"summary\": string, \"filesChanged\": string[], \"testsRun\": string[], \"followUps\": string[]}. summary is concise; filesChanged lists only files changed this turn; testsRun lists commands actually run with results; followUps lists real remaining work or is empty. Do not include Markdown fences or prose around the JSON in the report file.",
   ].join("\n");
 }
 
@@ -32,9 +35,6 @@ export function buildCodexInstruction(
       ? "Checks: run the most relevant lightweight check after editing."
       : "Checks: do not run verification commands for this turn unless the instruction itself explicitly requires them. Report tests as not run when skipped.",
     "",
-    "After finishing the requested work for this turn, write (create or overwrite) a JSON self-report file at this exact path:",
-    options.reportPath,
-    'Use exactly this shape: { "summary": string, "filesChanged": string[], "testsRun": string[], "followUps": string[] }',
-    "The summary must be a short plain-English account of what was actually done in this turn and the overall task's current state. filesChanged must list the files touched, testsRun must list verification commands actually run (or be an empty array), and followUps must list anything left undone or needing Claude's attention.",
+    `Write the required JSON self-report to ${options.reportPath}.`,
   ].join("\n");
 }

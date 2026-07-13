@@ -16,12 +16,13 @@ export const TaskSendSchema = z.object({
 
 export const TaskStatusSchema = z.object({
   taskId: z.string().min(1),
+  includeApprovalPayload: z.boolean().default(false),
 });
 
 export const TaskEventsSchema = z.object({
   taskId: z.string().min(1),
   afterSeq: z.number().int().nonnegative().optional(),
-  limit: z.number().int().positive().max(200).default(50),
+  limit: z.number().int().positive().max(200).default(20),
   markDelivered: z.boolean().default(true),
   includePayload: z.boolean().default(false),
 });
@@ -29,6 +30,9 @@ export const TaskEventsSchema = z.object({
 export const TaskDiffSchema = z.object({
   taskId: z.string().min(1),
   includePatch: z.boolean().default(false),
+  fileOffset: z.number().int().nonnegative().default(0),
+  fileLimit: z.number().int().positive().max(200).default(50),
+  includeAllFiles: z.boolean().default(false),
 });
 
 export const ApprovalDecideSchema = z.object({

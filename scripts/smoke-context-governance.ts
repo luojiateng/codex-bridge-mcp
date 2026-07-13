@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { CodexNotification } from "../src/codex/codexProtocol.js";
-import type { RuntimeHostRecord, TaskRecord } from "../src/storage/sqlite.js";
+import type { ApprovalRecord, RuntimeHostRecord, TaskRecord } from "../src/storage/sqlite.js";
 import { JsonlLogger } from "../src/storage/jsonlLogger.js";
 import { SqliteStore } from "../src/storage/sqlite.js";
 import { TaskService } from "../src/task/taskService.js";
@@ -83,6 +83,19 @@ const summarizedTokenEvent = summarized.events.find(
 ) as Record<string, unknown>;
 assert.equal("payload" in summarizedTokenEvent, false);
 assert.equal(typeof summarizedTokenEvent.summary, "string");
+assert.equal("taskId" in summarizedTokenEvent, false);
+assert.equal(summarized.runtimeHostId, runtime.id);
+assert.equal(summarized.codexThreadId, task.codexThreadId);
+
+const firstPage = await taskService.events({
+  taskId: task.id,
+  afterSeq: 0,
+  limit: 1,
+  markDelivered: false,
+});
+assert.equal(firstPage.returned, 1);
+assert.equal(firstPage.hasMore, true);
+assert.equal(typeof firstPage.nextAfterSeq, "number");
 
 const full = await taskService.events({
   taskId: task.id,
@@ -91,6 +104,36 @@ const full = await taskService.events({
   includePayload: true,
 });
 assert.equal("payload" in (full.events[0] as Record<string, unknown>), true);
+
+const approval: ApprovalRecord = {
+  id: "approval_context_smoke",
+  taskId: task.id,
+  runtimeHostId: runtime.id,
+  codexThreadId: task.codexThreadId,
+  codexTurnId: "turn_context_smoke",
+  codexRequestId: "request_context_smoke",
+  kind: "item/commandExecution/requestApproval",
+  command: "npm test",
+  cwd: tempDir,
+  reason: "Smoke approval",
+  riskSummary: "Runs local tests",
+  payload: { grantRoot: tempDir, noisy: "x".repeat(10_000) },
+  decision: null,
+  decidedBy: null,
+  decisionReason: null,
+  createdAt: "2026-07-08T00:00:00.000Z",
+  resolvedAt: null,
+};
+store.saveApproval(approval);
+const compactStatus = await taskService.status(task.id);
+const compactApproval = compactStatus.pendingApproval as Record<string, unknown>;
+assert.equal(compactApproval.id, approval.id);
+assert.equal("payload" in compactApproval, false);
+const expandedStatus = await taskService.status(task.id, { includeApprovalPayload: true });
+assert.deepEqual(
+  (expandedStatus.pendingApproval as ApprovalRecord).payload,
+  approval.payload,
+);
 
 store.close();
 console.log("Context governance smoke test passed.");

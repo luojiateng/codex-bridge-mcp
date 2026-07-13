@@ -124,6 +124,13 @@ export interface QueueSnapshot {
   lastInterruptedAt: string | null;
 }
 
+export interface RuntimeDependentsInterrupted {
+  tasks: TaskRecord[];
+  turns: TurnRecord[];
+  commands: TaskCommandRecord[];
+  approvals: ApprovalRecord[];
+}
+
 type RuntimeHostRow = {
   id: string;
   project_root: string;
@@ -277,6 +284,13 @@ export class SqliteStore {
       | RuntimeHostRow
       | undefined;
     return row ? runtimeFromRow(row) : null;
+  }
+
+  listRuntimes(): RuntimeHostRecord[] {
+    const rows = this.db
+      .prepare("select * from runtime_host order by created_at asc")
+      .all() as RuntimeHostRow[];
+    return rows.map(runtimeFromRow);
   }
 
   markRuntimeStatus(id: string, status: RuntimeStatus): void {
@@ -627,26 +641,111 @@ export class SqliteStore {
       .run(nowIso(), id);
   }
 
-  markRunningCommandsInterrupted(): TaskCommandRecord[] {
-    const running = this.db
-      .prepare("select * from task_command_queue where status = 'running' order by started_at asc")
-      .all() as TaskCommandRow[];
-    if (running.length === 0) {
-      return [];
-    }
-    const now = nowIso();
-    const update = this.db.prepare(
-      "update task_command_queue set status = 'interrupted', finished_at = ? where id = ?",
-    );
-    const tx = this.db.transaction((rows: TaskCommandRow[]) => {
-      for (const row of rows) {
-        update.run(now, row.id);
-        row.status = "interrupted";
-        row.finished_at = now;
+  markRuntimeDependentsInterrupted(runtimeHostId: string): RuntimeDependentsInterrupted {
+    const tx = this.db.transaction((): RuntimeDependentsInterrupted => {
+      const taskRows = this.db
+        .prepare("select * from task where runtime_host_id = ?")
+        .all(runtimeHostId) as TaskRow[];
+      const turnRows = this.db
+        .prepare(
+          `
+          select turn.* from turn
+          inner join task on task.id = turn.task_id
+          where task.runtime_host_id = ? and turn.status = 'running'
+          order by turn.created_at asc
+          `,
+        )
+        .all(runtimeHostId) as TurnRow[];
+      const commandRows = this.db
+        .prepare(
+          `
+          select task_command_queue.* from task_command_queue
+          inner join task on task.id = task_command_queue.task_id
+          where task.runtime_host_id = ? and task_command_queue.status = 'running'
+          order by task_command_queue.started_at asc
+          `,
+        )
+        .all(runtimeHostId) as TaskCommandRow[];
+      const approvalRows = this.db
+        .prepare(
+          `
+          select approval.* from approval
+          inner join task on task.id = approval.task_id
+          where task.runtime_host_id = ? and approval.decision is null
+          order by approval.created_at asc
+          `,
+        )
+        .all(runtimeHostId) as ApprovalRow[];
+
+      if (turnRows.length === 0 && commandRows.length === 0 && approvalRows.length === 0) {
+        return { tasks: [], turns: [], commands: [], approvals: [] };
       }
+
+      const now = nowIso();
+      const approvalDecisionReason =
+        "Bridge automatically denied this pending approval because its Runtime Host was unreachable and treated as DEAD.";
+      const affectedTaskIds = new Set([
+        ...turnRows.map((row) => row.task_id),
+        ...commandRows.map((row) => row.task_id),
+        ...approvalRows.map((row) => row.task_id),
+      ]);
+      const taskIdPlaceholders = [...affectedTaskIds].map(() => "?").join(", ");
+      this.db
+        .prepare(
+          `update task set status = 'interrupted', updated_at = ? where id in (${taskIdPlaceholders})`,
+        )
+        .run(now, ...affectedTaskIds);
+      this.db
+        .prepare(
+          `
+          update turn set status = 'interrupted', updated_at = ?
+          where status = 'running'
+            and task_id in (select id from task where runtime_host_id = ?)
+          `,
+        )
+        .run(now, runtimeHostId);
+      this.db
+        .prepare(
+          `
+          update task_command_queue set status = 'interrupted', finished_at = ?
+          where status = 'running'
+            and task_id in (select id from task where runtime_host_id = ?)
+          `,
+        )
+        .run(now, runtimeHostId);
+      this.db
+        .prepare(
+          `
+          update approval
+          set decision = 'auto_denied', decided_by = 'bridge', decision_reason = ?, resolved_at = ?
+          where decision is null
+            and task_id in (select id from task where runtime_host_id = ?)
+          `,
+        )
+        .run(approvalDecisionReason, now, runtimeHostId);
+
+      return {
+        tasks: taskRows
+          .filter((row) => affectedTaskIds.has(row.id))
+          .map((row) => taskFromRow({ ...row, status: "interrupted", updated_at: now })),
+        turns: turnRows.map((row) =>
+          turnFromRow({ ...row, status: "interrupted", updated_at: now }),
+        ),
+        commands: commandRows.map((row) =>
+          taskCommandFromRow({ ...row, status: "interrupted", finished_at: now }),
+        ),
+        approvals: approvalRows.map((row) =>
+          approvalFromRow({
+            ...row,
+            decision: "auto_denied",
+            decided_by: "bridge",
+            decision_reason: approvalDecisionReason,
+            resolved_at: now,
+          }),
+        ),
+      };
     });
-    tx(running);
-    return running.map(taskCommandFromRow);
+    return tx();
   }
 
   getQueueSnapshot(taskId: string): QueueSnapshot {

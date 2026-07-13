@@ -130,7 +130,7 @@ async function runTurn(
   const decidedApprovals = new Set<string>();
 
   while (Date.now() < deadline) {
-    const status = await taskService.status(taskId);
+    const status = await taskService.status(taskId, { includeApprovalPayload: true });
     const pendingApproval = status.pendingApproval as ApprovalRecord | null;
     if (pendingApproval && !decidedApprovals.has(pendingApproval.id)) {
       decidedApprovals.add(pendingApproval.id);

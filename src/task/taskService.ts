@@ -16,15 +16,16 @@ import {
   normalizeCodexEvent,
 } from "../codex/eventNormalizer.js";
 import { config, type BridgeConfig } from "../config/config.js";
+import { isHttpReady } from "../runtime/heartbeat.js";
 import { RuntimeHostManager } from "../runtime/runtimeHostManager.js";
 import { launchCodexTuiWindow } from "../runtime/tuiWindowManager.js";
 import { DiffService } from "../review/diffService.js";
 import { createId, createTaskId, nowIso } from "../shared/id.js";
 import { JsonlLogger } from "../storage/jsonlLogger.js";
 import {
+  type ApprovalRecord,
   type EventRecord,
   type RuntimeHostRecord,
-  type TaskCommandRecord,
   type TaskRecord,
   SqliteStore,
 } from "../storage/sqlite.js";
@@ -56,6 +57,18 @@ export interface TaskEventsInput {
   includePayload?: boolean;
 }
 
+export interface TaskStatusOptions {
+  includeApprovalPayload?: boolean;
+}
+
+export interface TaskDiffInput {
+  taskId: string;
+  includePatch?: boolean;
+  fileOffset?: number;
+  fileLimit?: number;
+  includeAllFiles?: boolean;
+}
+
 export interface TaskListInput {
   projectRoot?: string;
   status?: string;
@@ -77,15 +90,22 @@ interface TaskContext {
 
 interface EventSummary {
   seq: number;
-  taskId: string;
-  runtimeHostId: string;
-  codexThreadId: string;
   codexTurnId: string | null;
   eventType: string;
   summary: string;
   nextAction?: unknown;
   details?: Record<string, unknown>;
-  claudeDelivered: boolean;
+  createdAt: string;
+}
+
+interface ApprovalSummary {
+  id: string;
+  codexTurnId: string | null;
+  kind: string;
+  command: string | null;
+  cwd: string | null;
+  reason: string | null;
+  riskSummary: string | null;
   createdAt: string;
 }
 
@@ -97,6 +117,7 @@ export class TaskService {
   private readonly attachedClients = new WeakSet<CodexAppServerClient>();
   private readonly threadContexts = new Map<string, TaskContext>();
   private readonly turnContexts = new Map<string, TaskContext>();
+  private readonly startupRecovery: Promise<void>;
 
   constructor(
     private readonly store: SqliteStore,
@@ -106,7 +127,27 @@ export class TaskService {
     private readonly diffService: DiffService,
     private readonly bridgeConfig: BridgeConfig = config,
   ) {
-    this.recoverInterruptedQueue();
+    this.startupRecovery = this.recoverInterruptedQueue().catch(async (error: unknown) => {
+      await this.logger
+        .append("runtime", "startup", {
+          type: "runtime_dependent_recovery_failed",
+          error: error instanceof Error ? error.message : String(error),
+        })
+        .catch(() => undefined);
+    });
+  }
+
+  waitForStartupRecovery(): Promise<void> {
+    return this.startupRecovery;
+  }
+
+  bindTaskRuntimeEvents(
+    task: TaskRecord,
+    runtime: RuntimeHostRecord,
+    client: CodexAppServerClient,
+  ): void {
+    this.attachRuntimeEvents(runtime, client);
+    this.registerTaskContext(task);
   }
 
   async openTask(input: TaskOpenInput): Promise<{
@@ -241,18 +282,16 @@ export class TaskService {
     this.store.enqueueCommand(commandId, task.id, input.instruction);
     return this.queue.runExclusive(`runtime:${task.runtimeHostId}`, async () => {
       let turnStarted = false;
-      const latestTurn = this.store.getLatestTurn(task.id);
-      if (latestTurn?.status === "running") {
-        this.store.markCommandFailed(commandId);
-        throw new Error(`Task already has an active Codex turn: ${latestTurn.codexTurnId}`);
-      }
-
-      this.store.markCommandStarted(commandId);
       try {
         const runtime = await this.runtimeHostManager.ensureExistingRuntime(task.runtimeHostId);
+        const latestTurn = this.store.getLatestTurn(task.id);
+        if (latestTurn?.status === "running") {
+          throw new Error(`Task already has an active Codex turn: ${latestTurn.codexTurnId}`);
+        }
+
+        this.store.markCommandStarted(commandId);
         const client = await this.clientPool.getOrConnect(runtime.endpoint);
-        this.attachRuntimeEvents(runtime, client);
-        this.registerTaskContext(task);
+        this.bindTaskRuntimeEvents(task, runtime, client);
         await client.ensureThreadReady(
           task.codexThreadId,
           task.projectRoot,
@@ -335,7 +374,7 @@ export class TaskService {
     });
   }
 
-  async status(taskId: string): Promise<Record<string, unknown>> {
+  async status(taskId: string, options: TaskStatusOptions = {}): Promise<Record<string, unknown>> {
     const task = this.mustGetTask(taskId);
     const runtime = this.store.getRuntime(task.runtimeHostId);
     const latestTurn = this.store.getLatestTurn(task.id);
@@ -379,28 +418,42 @@ export class TaskService {
             updatedAt: contextUsage.updatedAt,
           }
         : null,
-      pendingApproval,
+      pendingApproval:
+        pendingApproval && !options.includeApprovalPayload
+          ? summarizeApproval(pendingApproval)
+          : pendingApproval,
       queue: this.store.getQueueSnapshot(task.id),
     };
   }
 
   async events(input: TaskEventsInput): Promise<{
     taskId: string;
+    runtimeHostId: string;
+    codexThreadId: string;
     events: Array<EventRecord | EventSummary>;
     returned: number;
+    nextAfterSeq: number | null;
+    hasMore: boolean;
   }> {
-    const limit = Math.min(Math.max(input.limit ?? 50, 1), 200);
-    const events =
+    const task = this.mustGetTask(input.taskId);
+    const limit = Math.min(Math.max(input.limit ?? 20, 1), 200);
+    const queriedEvents =
       input.afterSeq === undefined
-        ? this.store.listUndeliveredEvents(input.taskId, limit)
-        : this.store.listEvents(input.taskId, input.afterSeq, limit);
+        ? this.store.listUndeliveredEvents(input.taskId, limit + 1)
+        : this.store.listEvents(input.taskId, input.afterSeq, limit + 1);
+    const hasMore = queriedEvents.length > limit;
+    const events = queriedEvents.slice(0, limit);
     if (input.markDelivered ?? true) {
       this.store.markEventsDelivered(events.map((event) => event.seq));
     }
     return {
-      taskId: input.taskId,
+      taskId: task.id,
+      runtimeHostId: task.runtimeHostId,
+      codexThreadId: task.codexThreadId,
       events: input.includePayload ? events : events.map(summarizeEvent),
       returned: events.length,
+      nextAfterSeq: events.at(-1)?.seq ?? input.afterSeq ?? null,
+      hasMore,
     };
   }
 
@@ -438,9 +491,10 @@ export class TaskService {
     };
   }
 
-  async diff(taskId: string, includePatch: boolean): Promise<unknown> {
-    const task = this.mustGetTask(taskId);
-    return this.diffService.diffTask(task, includePatch);
+  async diff(input: TaskDiffInput | string, includePatch = false): Promise<unknown> {
+    const options = typeof input === "string" ? { taskId: input, includePatch } : input;
+    const task = this.mustGetTask(options.taskId);
+    return this.diffService.diffTask(task, options);
   }
 
   async decideApproval(input: ApprovalDecisionInput): Promise<{
@@ -852,30 +906,35 @@ export class TaskService {
     return task;
   }
 
-  private recoverInterruptedQueue(): void {
-    const interrupted = this.store.markRunningCommandsInterrupted();
-    for (const command of interrupted) {
-      const task = this.store.getTask(command.taskId);
-      if (!task) {
-        continue;
-      }
-      const event = this.store.appendEvent({
-        taskId: task.id,
-        runtimeHostId: task.runtimeHostId,
-        codexThreadId: task.codexThreadId,
-        codexTurnId: null,
-        eventType: "task_command_interrupted",
-        payload: {
-          type: "task_command_interrupted",
-          commandId: command.id,
-          startedAt: command.startedAt,
-          reason:
-            "Bridge restarted while this queued command was running; Claude should inspect task_status before resending.",
-          nextAction: "task_status",
-        },
-      });
-      void this.logger.append("tasks", task.id, event);
-    }
+  private async recoverInterruptedQueue(): Promise<void> {
+    await Promise.all(
+      this.store.listRuntimes().map(async (runtime) => {
+        try {
+          const alive = await isHttpReady(
+            runtime.endpoint,
+            this.bridgeConfig.runtimeReconnectTimeoutMs,
+          );
+          if (alive) {
+            this.store.markRuntimeHeartbeat(runtime.id);
+            const client = await this.clientPool.getOrConnect(runtime.endpoint);
+            for (const task of this.store.listOpenTasksForRuntime(runtime.id)) {
+              this.bindTaskRuntimeEvents(task, runtime, client);
+            }
+            return;
+          }
+          await this.runtimeHostManager.interruptRuntimeDependents(
+            runtime.id,
+            "Bridge startup could not reach this Runtime Host; its running work was marked interrupted.",
+          );
+        } catch (error) {
+          await this.logger.append("runtime", runtime.id, {
+            type: "runtime_startup_recovery_failed",
+            runtimeId: runtime.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }),
+    );
   }
 }
 
@@ -884,16 +943,25 @@ function summarizeEvent(event: EventRecord): EventSummary {
   const details = summarizeDetails(event.eventType, payload);
   return {
     seq: event.seq,
-    taskId: event.taskId,
-    runtimeHostId: event.runtimeHostId,
-    codexThreadId: event.codexThreadId,
     codexTurnId: event.codexTurnId,
     eventType: event.eventType,
     summary: summarizeMessage(event.eventType, payload),
     nextAction: payload.nextAction,
     details: Object.keys(details).length > 0 ? details : undefined,
-    claudeDelivered: event.claudeDelivered,
     createdAt: event.createdAt,
+  };
+}
+
+function summarizeApproval(approval: ApprovalRecord): ApprovalSummary {
+  return {
+    id: approval.id,
+    codexTurnId: approval.codexTurnId,
+    kind: approval.kind,
+    command: approval.command,
+    cwd: approval.cwd,
+    reason: approval.reason,
+    riskSummary: approval.riskSummary,
+    createdAt: approval.createdAt,
   };
 }
 
@@ -905,10 +973,14 @@ function summarizeMessage(eventType: string, payload: Record<string, unknown>): 
       return "Codex turn started on the existing task thread.";
     case "codex_turn_completed":
       return "Codex completed a turn; Claude should review the diff.";
+    case "codex_turn_interrupted":
+      return "A running Codex turn was interrupted after its Runtime Host became unreachable.";
     case "approval_requested":
       return `Codex requested ${String(payload.kind ?? "an")} approval.`;
     case "approval_resolved":
       return `Approval was ${String(payload.decision ?? "resolved")}.`;
+    case "approval_auto_denied":
+      return "A pending approval was automatically denied after its Runtime Host was treated as DEAD.";
     case "codex_thread_token_usage_updated":
       return "Codex reported an updated token usage snapshot.";
     case "context_near_limit":
@@ -939,6 +1011,15 @@ function summarizeDetails(
   if (eventType === "approval_requested") {
     return pick(payload, ["approvalId", "codexRequestId", "kind", "command", "cwd", "riskSummary"]);
   }
+  if (eventType === "approval_auto_denied") {
+    return pick(payload, [
+      "approvalId",
+      "decision",
+      "decidedBy",
+      "decisionReason",
+      "resolvedAt",
+    ]);
+  }
   if (eventType === "context_near_limit") {
     return pick(payload, ["totalTokens", "limit", "contextPercent", "limitSource"]);
   }
@@ -950,6 +1031,9 @@ function summarizeDetails(
   }
   if (eventType === "task_send_failed") {
     return pick(payload, ["commandId", "runtimeEndpoint", "error"]);
+  }
+  if (eventType === "codex_turn_interrupted") {
+    return pick(payload, ["codexTurnId", "interruptedAt"]);
   }
   if (eventType === "task_command_interrupted") {
     return pick(payload, ["commandId", "startedAt"]);

@@ -198,6 +198,16 @@ tool_timeout_sec = 600
 
 工具输入的准确 schema 位于 [`src/mcp/schemas.ts`](src/mcp/schemas.ts)，注册入口位于 [`src/mcp/tools.ts`](src/mcp/tools.ts)。
 
+### 低噪音地读取任务信息
+
+这三个读取工具默认优先返回足以继续决策的摘要，避免把历史事件、审批原文或大 diff 重复送进 Claude/Codex 上下文。需要排查时再明确展开：
+
+- `task_status` 默认只返回待审批请求的可决策摘要；需要 Codex 的完整审批原文时传入 `includeApprovalPayload: true`。
+- `task_events` 默认每页最多返回 20 条摘要事件，并返回 `nextAfterSeq` 和 `hasMore` 供后续翻页；需要原始事件内容时传入 `includePayload: true`。
+- `task_diff` 默认返回短统计和最多 50 个变更文件；可用 `fileOffset`、`fileLimit` 翻页，`includeAllFiles: true` 获取完整文件列表，`includePatch: true` 获取行级 patch。
+
+完整 payload 和 patch 没有被删除，只是不再作为默认上下文负担。
+
 ## 几条不会退让的保证
 
 - 一个 `projectRoot` 最多只有一个活跃 Runtime Host；
@@ -235,7 +245,7 @@ Bridge 还可以为任务打开一个可见的 Codex remote TUI：
 
 | 环境变量 | 默认值 / 作用 |
 | --- | --- |
-| `CODEX_BRIDGE_DATA_DIR` | 当前目录下的 `data` |
+| `CODEX_BRIDGE_DATA_DIR` | Bridge 安装目录下的 `data` |
 | `CODEX_BRIDGE_DB_PATH` | `data/bridge.db` |
 | `CODEX_BRIDGE_LOGS_DIR` | `data/logs` |
 | `CODEX_BRIDGE_RUNTIME_SCRIPTS_DIR` | `data/runtime-scripts` |
@@ -279,6 +289,8 @@ npm run smoke:protocol
 npm run smoke:context
 npm run smoke:queue
 npm run smoke:recovery
+npm run smoke:runtime-interruption
+npm run smoke:diff
 npm run smoke:mcp
 ```
 
