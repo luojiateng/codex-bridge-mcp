@@ -1,9 +1,9 @@
-import { CodexClientPool } from "../codex/codexAppServerClient.js";
+import { CodexClientPool, type CodexAppServerClient } from "../codex/codexAppServerClient.js";
 import { config, type BridgeConfig } from "../config/config.js";
 import { RuntimeHostManager } from "../runtime/runtimeHostManager.js";
 import { launchCodexTuiWindow } from "../runtime/tuiWindowManager.js";
 import { JsonlLogger } from "../storage/jsonlLogger.js";
-import { SqliteStore } from "../storage/sqlite.js";
+import { type RuntimeHostRecord, type TaskRecord, SqliteStore } from "../storage/sqlite.js";
 import { buildCodexDeveloperInstructions } from "./codexInstruction.js";
 
 export class RecoveryService {
@@ -13,6 +13,11 @@ export class RecoveryService {
     private readonly clientPool: CodexClientPool,
     private readonly logger: JsonlLogger,
     private readonly bridgeConfig: BridgeConfig = config,
+    private readonly bindTaskRuntimeEvents: (
+      task: TaskRecord,
+      runtime: RuntimeHostRecord,
+      client: CodexAppServerClient,
+    ) => void = () => undefined,
   ) {}
 
   async recoverTask(taskId: string): Promise<{
@@ -34,6 +39,7 @@ export class RecoveryService {
     }
     const runtime = await this.runtimeHostManager.recoverRuntime(task.runtimeHostId);
     const client = await this.clientPool.getOrConnect(runtime.endpoint);
+    this.bindTaskRuntimeEvents(task, runtime, client);
     await client.ensureThreadReady(
       task.codexThreadId,
       task.projectRoot,

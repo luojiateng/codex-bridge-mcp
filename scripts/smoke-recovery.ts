@@ -9,8 +9,14 @@ import { CodexClientPool } from "../src/codex/codexAppServerClient.js";
 import type { BridgeConfig } from "../src/config/config.js";
 import { RuntimeHostManager } from "../src/runtime/runtimeHostManager.js";
 import { JsonlLogger } from "../src/storage/jsonlLogger.js";
-import { type RuntimeHostRecord, type TaskRecord, SqliteStore } from "../src/storage/sqlite.js";
+import {
+  type RuntimeHostRecord,
+  type TaskRecord,
+  type TurnRecord,
+  SqliteStore,
+} from "../src/storage/sqlite.js";
 import { RecoveryService } from "../src/task/recoveryService.js";
+import { TaskService } from "../src/task/taskService.js";
 
 interface RpcMessage {
   id?: string | number;
@@ -23,6 +29,7 @@ const projectRoot = path.join(tempDir, "project");
 await fs.mkdir(projectRoot, { recursive: true });
 
 const messages: RpcMessage[] = [];
+let activeSocket: WebSocket | null = null;
 const httpServer = http.createServer((request, response) => {
   if (request.url === "/readyz" || request.url === "/healthz") {
     response.writeHead(200, { "content-type": "text/plain" });
@@ -37,6 +44,7 @@ httpServer.on("upgrade", (request, socket, head) => {
   wss.handleUpgrade(request, socket, head, (ws) => wss.emit("connection", ws, request));
 });
 wss.on("connection", (socket) => {
+  activeSocket = socket;
   socket.on("message", (raw) => {
     const message = JSON.parse(raw.toString("utf8")) as RpcMessage;
     messages.push(message);
@@ -74,7 +82,6 @@ const store = new SqliteStore(config.dbPath);
 const logger = new JsonlLogger(config.logsDir);
 const clientPool = new CodexClientPool(config);
 const runtimeHostManager = new RuntimeHostManager(store, logger, clientPool, config);
-const recoveryService = new RecoveryService(store, runtimeHostManager, clientPool, logger, config);
 
 const runtime: RuntimeHostRecord = {
   id: "runtime_recovery_smoke",
@@ -105,6 +112,29 @@ const task: TaskRecord = {
 };
 store.saveRuntime(runtime);
 store.saveTask(task);
+const runningTurn: TurnRecord = {
+  id: "turn_recovery_smoke",
+  taskId: task.id,
+  codexThreadId: task.codexThreadId,
+  codexTurnId: "codex_turn_recovery_smoke",
+  status: "running",
+  instruction: "Recover this turn",
+  createdAt: "2026-07-08T00:00:00.000Z",
+  updatedAt: "2026-07-08T00:00:00.000Z",
+};
+store.saveTurn(runningTurn);
+const taskService = new TaskService(store, runtimeHostManager, clientPool, logger, {} as never, config);
+await taskService.waitForStartupRecovery();
+clientPool.drop(endpoint);
+const recoveryService = new RecoveryService(
+  store,
+  runtimeHostManager,
+  clientPool,
+  logger,
+  config,
+  (recoveredTask, recoveredRuntime, recoveredClient) =>
+    taskService.bindTaskRuntimeEvents(recoveredTask, recoveredRuntime, recoveredClient),
+);
 
 const recovered = await recoveryService.recoverTask(task.id);
 assert.equal(recovered.runtimeHostId, runtime.id);
@@ -119,6 +149,18 @@ assert.equal(
   store.listEvents(task.id, 0, 20).some((event) => event.eventType === "task_recovered"),
   true,
 );
+assert(activeSocket);
+activeSocket.send(
+  JSON.stringify({
+    method: "turn/completed",
+    params: {
+      threadId: task.codexThreadId,
+      turn: { id: runningTurn.codexTurnId, status: "completed" },
+    },
+  }),
+);
+await waitFor(() => store.getLatestTurn(task.id)?.status === "completed");
+assert.equal(store.getTask(task.id)?.status, "waiting_review");
 
 clientPool.drop(endpoint);
 store.close();
@@ -148,4 +190,14 @@ function handleClientMessage(socket: WebSocket, message: RpcMessage): void {
 
 function respond(socket: WebSocket, id: string | number, result: unknown): void {
   socket.send(JSON.stringify({ id, result }));
+}
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+  const deadline = Date.now() + 1_000;
+  while (!predicate()) {
+    if (Date.now() >= deadline) {
+      throw new Error("Timed out waiting for recovered Runtime events.");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }

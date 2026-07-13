@@ -33,18 +33,22 @@ export function registerTools(
     jsonResult(await taskService.sendTask(TaskSendSchema.parse(input))),
   );
 
-  server.tool("task_status", "Return a short task/runtime/turn status snapshot.", TaskStatusSchema.shape, async (input) => {
+  server.tool("task_status", "Return a compact task/runtime/turn snapshot; request approval payload only when it is needed.", TaskStatusSchema.shape, async (input) => {
     const parsed = TaskStatusSchema.parse(input);
-    return jsonResult(await taskService.status(parsed.taskId));
+    return jsonResult(
+      await taskService.status(parsed.taskId, {
+        includeApprovalPayload: parsed.includeApprovalPayload,
+      }),
+    );
   });
 
-  server.tool("task_events", "Return undelivered or after-sequence events without full logs.", TaskEventsSchema.shape, async (input) =>
+  server.tool("task_events", "Return compact event pages; request raw payloads only for an event that needs diagnosis.", TaskEventsSchema.shape, async (input) =>
     jsonResult(await taskService.events(TaskEventsSchema.parse(input))),
   );
 
-  server.tool("task_diff", "Return summarized working-tree diff for Claude review.", TaskDiffSchema.shape, async (input) => {
+  server.tool("task_diff", "Return a short diff summary and paged file list; request a full patch only for line-level review.", TaskDiffSchema.shape, async (input) => {
     const parsed = TaskDiffSchema.parse(input);
-    return jsonResult(await taskService.diff(parsed.taskId, parsed.includePatch));
+    return jsonResult(await taskService.diff(parsed));
   });
 
   server.tool("approval_decide", "Forward Claude's approval decision to Codex.", ApprovalDecideSchema.shape, async (input) =>

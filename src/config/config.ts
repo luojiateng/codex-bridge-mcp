@@ -1,4 +1,5 @@
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 export interface BridgeConfig {
   dataDir: string;
@@ -21,8 +22,8 @@ export interface BridgeConfig {
   runtimeHostWindow: "hidden" | "visible";
 }
 
-const projectRoot = process.cwd();
-const dataDir = process.env.CODEX_BRIDGE_DATA_DIR ?? path.join(projectRoot, "data");
+const installRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+const dataDir = process.env.CODEX_BRIDGE_DATA_DIR ?? path.join(installRoot, "data");
 
 export const config: BridgeConfig = {
   dataDir,

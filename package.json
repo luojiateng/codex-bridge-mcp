@@ -18,6 +18,8 @@
     "smoke:context": "tsx scripts/smoke-context-governance.ts",
     "smoke:queue": "tsx scripts/smoke-queue-recovery.ts",
     "smoke:recovery": "tsx scripts/smoke-recovery.ts",
+    "smoke:runtime-interruption": "tsx scripts/smoke-runtime-interruption.ts",
+    "smoke:diff": "tsx scripts/smoke-diff-service.ts",
     "smoke:mcp": "tsx scripts/smoke-mcp-stdio.ts",
     "demo:claude": "tsx scripts/demo-claude-via-mcp.ts",
     "e2e:real": "tsx scripts/e2e-real-runtime.ts"

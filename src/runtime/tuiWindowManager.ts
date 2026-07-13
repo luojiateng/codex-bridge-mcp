@@ -34,6 +34,10 @@ function isProcessAlive(pid: number | null): boolean {
 export async function launchCodexTuiWindow(
   input: CodexTuiWindowInput,
   bridgeConfig: BridgeConfig = config,
+  launchScript: (
+    scriptPath: string,
+    projectRoot: string,
+  ) => Promise<number | null> = launchVisiblePowerShellScript,
 ): Promise<CodexTuiWindowResult> {
   if (bridgeConfig.codexTuiMode === "off") {
     return {
@@ -63,7 +67,7 @@ export async function launchCodexTuiWindow(
     threadId: input.threadId,
     mode: bridgeConfig.codexTuiMode,
   });
-  const pid = await launchVisiblePowerShellScript(scriptPath, input.projectRoot);
+  const pid = await launchScript(scriptPath, input.projectRoot);
   launchedThreads.set(key, pid);
   return {
     launched: true,
@@ -71,6 +75,15 @@ export async function launchCodexTuiWindow(
     pid,
     scriptPath,
   };
+}
+
+export function invalidateCodexTuiWindows(endpoint: string): void {
+  const keyPrefix = `${endpoint}:`;
+  for (const key of launchedThreads.keys()) {
+    if (key.startsWith(keyPrefix)) {
+      launchedThreads.delete(key);
+    }
+  }
 }
 
 function launchVisiblePowerShellScript(scriptPath: string, projectRoot: string): Promise<number | null> {

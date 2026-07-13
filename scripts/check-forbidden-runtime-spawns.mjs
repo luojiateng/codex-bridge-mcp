@@ -5,24 +5,36 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const src = path.join(root, "src");
 
-const forbidden = [
+const forbiddenResumeSpawns = [
   /spawn\s*\(\s*["']codex["']\s*,\s*\[[^\]]*["']resume["']/,
   /spawn\s*\(\s*["']codex["']\s*,\s*\[[^\]]*["']exec["'][^\]]*["']resume["']/,
   /codex\s+-resume/i,
   /codex\s+resume/i,
   /codex\s+exec\s+resume/i,
-  /spawn\s*\(\s*["']cmd\.exe["']/i,
 ];
-
-const allowed = [/codex app-server/];
+const forbiddenTaskSendSpawns = [
+  ...forbiddenResumeSpawns,
+  /spawn\s*\(/i,
+  /execFile\s*\(/i,
+  /cmd\.exe/i,
+  /powershell(?:\.exe)?/i,
+];
 const findings = [];
 
 for (const file of walk(src)) {
   const text = fs.readFileSync(file, "utf8");
-  for (const pattern of forbidden) {
-    if (pattern.test(text) && !allowed.some((ok) => ok.test(text))) {
+  for (const pattern of forbiddenResumeSpawns) {
+    if (pattern.test(text)) {
       findings.push(`${path.relative(root, file)} matches ${pattern}`);
     }
+  }
+}
+
+const taskServicePath = path.join(src, "task", "taskService.ts");
+const taskServiceText = fs.readFileSync(taskServicePath, "utf8");
+for (const pattern of forbiddenTaskSendSpawns) {
+  if (pattern.test(taskServiceText)) {
+    findings.push(`${path.relative(root, taskServicePath)} matches ${pattern}`);
   }
 }
 
@@ -34,7 +46,7 @@ if (findings.length > 0) {
   process.exit(1);
 }
 
-console.log("No forbidden Codex resume/runtime spawn patterns found in src/.");
+console.log("No forbidden Codex resume/runtime spawn patterns found in src/ or task_send.");
 
 function* walk(dir) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
