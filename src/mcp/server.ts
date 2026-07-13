@@ -12,11 +12,11 @@ import { TaskService } from "../task/taskService.js";
 import { registerTools } from "./tools.js";
 
 const instructions = [
-  "Codex Bridge MCP keeps Claude Code connected to one long-lived Codex Runtime Host.",
+  "Codex Bridge MCP keeps a task orchestrator, such as Claude Code or Codex, connected to one long-lived Codex Runtime Host.",
   "Use task_open once for a new requirement.",
   "Use task_send for every follow-up instruction on the same taskId.",
   "Do not ask this bridge to use CLI resume commands.",
-  "Approval requests must be handled by Claude through approval_decide.",
+  "Approval requests must be handled by the task orchestrator through approval_decide.",
   "After codex_turn_completed, call task_diff before accepting the work.",
 ].join("\n");
 

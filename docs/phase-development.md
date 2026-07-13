@@ -224,6 +224,7 @@ Acceptance:
 | Feature | Implementation Area |
 | --- | --- |
 | Claude as task brain | Tool instructions and docs |
+| Codex as optional task brain | The same MCP tools with role-neutral task instructions |
 | Codex as execution engine | App Server client and runtime host |
 | Bridge as reliable session layer | Runtime, task, event, approval, recovery services |
 | No `codex -resume` main path | Runtime manager guardrails and forbidden scanner |
