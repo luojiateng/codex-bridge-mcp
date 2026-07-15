@@ -4,4 +4,8 @@ data/bridge.db
 data/bridge.db-*
 data/runtime-scripts/*.ps1
 data/logs/
+data/mcp-token
+data/build-check/
+.codegraph/
+.claude/
 .env

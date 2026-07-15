@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -14,5 +15,11 @@ for (const asset of assets) {
   fs.mkdirSync(path.dirname(asset.to), { recursive: true });
   fs.copyFileSync(asset.from, asset.to);
 }
+
+fs.writeFileSync(
+  path.join(root, "dist", "build-id.txt"),
+  `${new Date().toISOString()}-${randomUUID()}\n`,
+  "utf8",
+);
 
 console.log("Copied static assets into dist/.");

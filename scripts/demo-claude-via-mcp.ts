@@ -3,34 +3,31 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { config } from "../src/config/config.js";
 
 type JsonObject = Record<string, unknown>;
 
-const projectRoot = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
-const entrypoint = path.join(projectRoot, "dist", "index.js");
 const defaultFixtureBase = process.platform === "win32" ? "E:\\tmp" : os.tmpdir();
 const fixtureRoot = path.resolve(
   process.env.CODEX_BRIDGE_CLAUDE_DEMO_PROJECT_ROOT ??
     path.join(defaultFixtureBase, "codex-bridge-mcp-claude-demo"),
 );
 const demoFile = path.join(fixtureRoot, "claude-demo.txt");
-const dataDir = path.join(fixtureRoot, ".codex-bridge-data");
-let eventCursor = 0;
+const bridgeUrl = process.env.CODEX_BRIDGE_MCP_URL ?? "http://127.0.0.1:43110/mcp";
+const bridgeToken =
+  process.env.CODEX_BRIDGE_MCP_TOKEN?.trim() ??
+  (await fs.readFile(path.join(config.dataDir, "mcp-token"), "utf8")).trim();
 
 await prepareFixture();
 
-const transport = new StdioClientTransport({
-  command: process.execPath,
-  args: [entrypoint],
-  cwd: projectRoot,
-  env: {
-    ...stringEnv(),
-    CODEX_BRIDGE_DATA_DIR: dataDir,
+const transport = new StreamableHTTPClientTransport(new URL(bridgeUrl), {
+  requestInit: {
+    headers: {
+      Authorization: `Bearer ${bridgeToken}`,
+    },
   },
-  stderr: "pipe",
 });
 
 const client = new Client(
@@ -110,64 +107,38 @@ try {
 }
 
 async function runClaudeTurn(taskId: string, instruction: string): Promise<JsonObject> {
-  const started = await callToolJson("task_send", { taskId, instruction });
-  logStep("Claude -> task_send", summarize(started));
-  const deadline = Date.now() + Number(process.env.CODEX_BRIDGE_CLAUDE_DEMO_TIMEOUT_MS ?? 240_000);
-  const decidedApprovals = new Set<string>();
+  let response = await callToolJson("task_send", { taskId, instruction });
+  logStep("Claude -> task_send", summarize(response));
 
-  while (Date.now() < deadline) {
-    const status = await callToolJson("task_status", { taskId });
-    const pendingApproval = toRecord(status.pendingApproval);
-    if (pendingApproval && !decidedApprovals.has(String(pendingApproval.id))) {
-      decidedApprovals.add(String(pendingApproval.id));
+  while (true) {
+    const attention = toRecord(response.attention);
+    const kind = String(attention?.kind ?? "");
+    if (kind === "approval") {
+      const pendingApproval = toRecord(attention?.payload);
+      assert(pendingApproval);
       const safe = isFixtureApproval(pendingApproval);
       const decision = safe ? "approve" : "deny";
-      const approvalResult = await callToolJson("approval_decide", {
+      response = await callToolJson("approval_decide", {
         taskId,
-        approvalId: pendingApproval.id,
+        approvalId: pendingApproval.approvalId ?? pendingApproval.id,
         decision,
         reason: safe
           ? "Claude simulator approved fixture-local action requested by the current task."
           : "Claude simulator denied action outside the fixture or outside the stated task.",
       });
-      logStep("Claude -> approval_decide", summarize(approvalResult));
+      logStep("Claude -> approval_decide", summarize(response));
+      continue;
     }
-
-    const events = await callToolJson("task_events", {
-      taskId,
-      afterSeq: eventCursor,
-      limit: 50,
-      markDelivered: false,
-    });
-    const batch = Array.isArray(events.events) ? (events.events as JsonObject[]) : [];
-    for (const event of batch) {
-      eventCursor = Math.max(eventCursor, Number(event.seq ?? 0));
+    if (kind === "completed") {
+      return response;
     }
-    const interesting = batch.filter((event) =>
-      ["approval_requested", "codex_turn_completed", "context_near_limit"].includes(
-        String(event.eventType),
-      ),
-    );
-    if (interesting.length > 0) {
-      logStep("Claude <- task_events summaries", interesting.map(summarize));
-    }
-    if (
-      batch.some(
-        (event) =>
-          event.eventType === "codex_turn_completed" && event.codexTurnId === started.turnId,
-      )
-    ) {
-      return started;
-    }
-
-    await delay(2_000);
+    throw new Error(`Codex turn ended with ${kind || String(response.status ?? "unknown")}.`);
   }
-
-  throw new Error(`Timed out waiting for Codex turn to complete: ${String(started.turnId)}`);
 }
 
 async function callToolJson(name: string, args: JsonObject): Promise<JsonObject> {
-  const result = await client.callTool({ name, arguments: args });
+  const timeout = Number(process.env.CODEX_BRIDGE_CLAUDE_DEMO_TIMEOUT_MS ?? 600_000);
+  const result = await client.callTool({ name, arguments: args }, undefined, { timeout });
   const content = "content" in result && Array.isArray(result.content) ? result.content : [];
   const text = content.find((item) => item.type === "text")?.text;
   if (!text) {
@@ -257,18 +228,4 @@ function runGit(args: string[]): void {
   if (result.status !== 0) {
     throw new Error(`git ${args.join(" ")} failed:\n${result.stderr || result.stdout}`);
   }
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function stringEnv(): Record<string, string> {
-  const output: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined) {
-      output[key] = value;
-    }
-  }
-  return output;
 }

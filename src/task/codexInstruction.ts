@@ -1,6 +1,5 @@
 export interface CodexInstructionOptions {
   runChecks: boolean;
-  reportPath: string;
 }
 
 export function buildCodexDeveloperInstructions(): string {
@@ -19,7 +18,7 @@ export function buildCodexDeveloperInstructions(): string {
     "9. Do not run verification commands after simple deterministic edits unless the task orchestrator explicitly asks or the turn says checks are required.",
     "10. Keep tool output economical: use focused searches, inspect summaries before full files, avoid duplicate reads, and run the smallest relevant check.",
     "11. Do not print or repeat full logs, diffs, generated files, or command output unless the task specifically needs them; retain only decisive lines and failures.",
-    "12. At the end of every turn, create or overwrite the required JSON self-report. Its exact shape is {\"summary\": string, \"filesChanged\": string[], \"testsRun\": string[], \"followUps\": string[]}. summary is concise; filesChanged lists only files changed this turn; testsRun lists commands actually run with results; followUps lists real remaining work or is empty. Do not include Markdown fences or prose around the JSON in the report file.",
+    "12. End every turn with one concise final message containing only: changes, files, tests, and unfinished items.",
   ].join("\n");
 }
 
@@ -34,7 +33,5 @@ export function buildCodexInstruction(
     options.runChecks
       ? "Checks: run the most relevant lightweight check after editing."
       : "Checks: do not run verification commands for this turn unless the instruction itself explicitly requires them. Report tests as not run when skipped.",
-    "",
-    `Write the required JSON self-report to ${options.reportPath}.`,
   ].join("\n");
 }

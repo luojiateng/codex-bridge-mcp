@@ -63,6 +63,14 @@ assert.deepEqual((warningStatus.context as Record<string, unknown>)?.nearLimit, 
 
 await privateTaskService.handleNotification(runtime, tokenUsageNotification(860));
 await privateTaskService.handleNotification(runtime, tokenUsageNotification(900));
+await privateTaskService.handleNotification(runtime, {
+  method: "error",
+  params: {
+    threadId: task.codexThreadId,
+    turnId: "turn_context_smoke",
+    message: "semantic smoke error",
+  },
+});
 
 const usage = store.getContextUsage(task.id);
 assert.equal(usage?.totalTokens, 900);
@@ -71,19 +79,19 @@ assert.equal(usage?.nearLimitEmitted, true);
 
 const events = store.listEvents(task.id, 0, 20);
 assert.equal(events.filter((event) => event.eventType === "context_near_limit").length, 1);
-assert.equal(events.some((event) => event.eventType === "codex_thread_token_usage_updated"), true);
+assert.equal(events.some((event) => event.eventType === "codex_thread_token_usage_updated"), false);
 
 const summarized = await taskService.events({
   taskId: task.id,
   afterSeq: 0,
   markDelivered: false,
 });
-const summarizedTokenEvent = summarized.events.find(
-  (event) => event.eventType === "codex_thread_token_usage_updated",
+const summarizedContextEvent = summarized.events.find(
+  (event) => event.eventType === "context_near_limit",
 ) as Record<string, unknown>;
-assert.equal("payload" in summarizedTokenEvent, false);
-assert.equal(typeof summarizedTokenEvent.summary, "string");
-assert.equal("taskId" in summarizedTokenEvent, false);
+assert.equal("payload" in summarizedContextEvent, false);
+assert.equal(typeof summarizedContextEvent.summary, "string");
+assert.equal("taskId" in summarizedContextEvent, false);
 assert.equal(summarized.runtimeHostId, runtime.id);
 assert.equal(summarized.codexThreadId, task.codexThreadId);
 

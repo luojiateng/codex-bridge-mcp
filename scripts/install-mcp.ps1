@@ -4,13 +4,18 @@ param(
 )
 
 $distIndex = Join-Path $ProjectRoot "dist\index.js"
+$tomlDistIndex = $distIndex.Replace('\', '\\')
+$tomlProjectRoot = $ProjectRoot.Replace('\', '\\')
 
-Write-Host "Codex Bridge MCP install snippet"
+Write-Host "Codex Bridge MCP stdio setup"
 Write-Host ""
 Write-Host "[mcp_servers.$ServerName]"
 Write-Host 'command = "node"'
-Write-Host "args = [`"$distIndex`"]"
+Write-Host "args = [`"$tomlDistIndex`"]"
+Write-Host "cwd = `"$tomlProjectRoot`""
 Write-Host "startup_timeout_sec = 20"
 Write-Host "tool_timeout_sec = 600"
 Write-Host ""
-Write-Host "Add this snippet to a trusted Codex/Claude MCP config after running npm install and npm run build."
+Write-Host "Use the same node/dist/index.js stdio command in Claude Code."
+Write-Host "The stdio adapter starts or reuses one shared local Bridge Core automatically."
+Write-Host "No bearer token or separately managed Core terminal is required for stdio clients."

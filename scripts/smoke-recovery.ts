@@ -123,8 +123,27 @@ const runningTurn: TurnRecord = {
   updatedAt: "2026-07-08T00:00:00.000Z",
 };
 store.saveTurn(runningTurn);
+const completedTask: TaskRecord = {
+  ...task,
+  id: "task_recovery_completed",
+  codexThreadId: "thread_recovery_completed",
+  codexThreadName: "Recovery Completed",
+};
+const completedTurn: TurnRecord = {
+  ...runningTurn,
+  id: "turn_recovery_completed",
+  taskId: completedTask.id,
+  codexThreadId: completedTask.codexThreadId,
+  codexTurnId: "codex_turn_recovery_completed",
+};
+store.saveTask(completedTask);
+store.saveTurn(completedTurn);
 const taskService = new TaskService(store, runtimeHostManager, clientPool, logger, {} as never, config);
 await taskService.waitForStartupRecovery();
+assert.equal(messages.some((message) => message.method === "thread/read"), true);
+assert.equal(store.getLatestTurn(task.id)?.status, "running");
+assert.equal(store.getLatestTurn(completedTask.id)?.status, "completed");
+assert.equal(store.getTask(completedTask.id)?.status, "waiting_review");
 clientPool.drop(endpoint);
 const recoveryService = new RecoveryService(
   store,
@@ -182,7 +201,25 @@ function handleClientMessage(socket: WebSocket, message: RpcMessage): void {
     return;
   }
   if (message.method === "thread/resume") {
-    respond(socket, message.id, { thread: { id: "thread_recovery_smoke" } });
+    respond(socket, message.id, { thread: { id: message.params?.threadId } });
+    return;
+  }
+  if (message.method === "thread/read") {
+    const threadId = String(message.params?.threadId ?? "");
+    const isCompleted = threadId === completedTask.codexThreadId;
+    respond(socket, message.id, {
+      thread: {
+        id: threadId,
+        status: isCompleted ? { type: "idle" } : { type: "active", activeFlags: [] },
+        turns: [
+          {
+            id: isCompleted ? completedTurn.codexTurnId : runningTurn.codexTurnId,
+            status: isCompleted ? "completed" : "inProgress",
+            error: null,
+          },
+        ],
+      },
+    });
     return;
   }
   respond(socket, message.id, {});

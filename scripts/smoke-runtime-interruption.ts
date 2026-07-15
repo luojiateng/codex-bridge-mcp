@@ -8,7 +8,8 @@ import { WebSocketServer, type WebSocket } from "ws";
 import { CodexClientPool } from "../src/codex/codexAppServerClient.js";
 import { config as defaultConfig, type BridgeConfig } from "../src/config/config.js";
 import { RuntimeHostManager } from "../src/runtime/runtimeHostManager.js";
-import { launchCodexTuiWindow } from "../src/runtime/tuiWindowManager.js";
+import { TuiWindowManager } from "../src/runtime/tuiWindowManager.js";
+import { canonicalizeProjectRoot } from "../src/shared/projectRoot.js";
 import { JsonlLogger } from "../src/storage/jsonlLogger.js";
 import {
   type ApprovalRecord,
@@ -26,10 +27,12 @@ interface RpcMessage {
 }
 
 const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-bridge-interruption-"));
-const targetProjectRoot = path.join(tempDir, "target-project");
-const otherProjectRoot = path.join(tempDir, "other-project");
-await fs.mkdir(targetProjectRoot, { recursive: true });
-await fs.mkdir(otherProjectRoot, { recursive: true });
+const targetProjectDir = path.join(tempDir, "target-project");
+const otherProjectDir = path.join(tempDir, "other-project");
+await fs.mkdir(targetProjectDir, { recursive: true });
+await fs.mkdir(otherProjectDir, { recursive: true });
+const targetProjectRoot = canonicalizeProjectRoot(targetProjectDir).projectRoot;
+const otherProjectRoot = canonicalizeProjectRoot(otherProjectDir).projectRoot;
 
 let readinessChecks = 0;
 const messages: RpcMessage[] = [];
@@ -67,13 +70,34 @@ const bridgeConfig: BridgeConfig = {
   logsDir: path.join(tempDir, "data", "logs"),
   runtimeScriptsDir: path.join(tempDir, "data", "runtime-scripts"),
   runtimeReconnectTimeoutMs: 100,
-  codexTuiMode: "off",
+  codexTuiMode: "remote",
 };
 
 const store = new SqliteStore(bridgeConfig.dbPath);
 const logger = new JsonlLogger(bridgeConfig.logsDir);
 const clientPool = new CodexClientPool(bridgeConfig);
-const runtimeHostManager = new RuntimeHostManager(store, logger, clientPool, bridgeConfig);
+const aliveTuiPids = new Set<number>();
+let nextTuiPid = 9_900;
+let tuiLaunchCount = 0;
+const launchTuiStub = async (): Promise<number> => {
+  tuiLaunchCount += 1;
+  const pid = nextTuiPid++;
+  aliveTuiPids.add(pid);
+  return pid;
+};
+const tuiWindowManager = new TuiWindowManager(store, bridgeConfig, launchTuiStub, {
+  isAlive: (pid) => pid !== null && aliveTuiPids.has(pid),
+  terminate: (pid) => {
+    aliveTuiPids.delete(pid);
+  },
+});
+const runtimeHostManager = new RuntimeHostManager(
+  store,
+  logger,
+  clientPool,
+  bridgeConfig,
+  tuiWindowManager,
+);
 const timestamp = "2026-07-12T00:00:00.000Z";
 const targetRuntime: RuntimeHostRecord = {
   id: "runtime_interruption_target",
@@ -169,6 +193,7 @@ store.saveRuntime(targetRuntime);
 store.saveRuntime(otherRuntime);
 store.saveTask(targetTask);
 store.saveTask(otherTask);
+const targetSession = store.activateProjectSessionForTask(targetTask);
 store.saveTurn(targetTurn);
 store.saveTurn(otherTurn);
 store.saveApproval(targetApproval);
@@ -196,31 +221,24 @@ runtimeHostManagerInternals.startRuntimeHost = async (projectRoot, previousRunti
   return recreated;
 };
 
-const tuiConfig: BridgeConfig = {
-  ...bridgeConfig,
-  codexTuiMode: "remote",
-};
 const tuiInput = {
+  sessionId: targetSession.id,
+  sessionGeneration: targetSession.generation,
   runtimeId: targetRuntime.id,
   projectRoot: targetProjectRoot,
   endpoint,
   threadId: targetTask.codexThreadId,
 };
-let tuiLaunchCount = 0;
-const launchTuiStub = async (): Promise<number> => {
-  tuiLaunchCount += 1;
-  return process.pid;
-};
-const initialTuiLaunch = await launchCodexTuiWindow(tuiInput, tuiConfig, launchTuiStub);
+const initialTuiLaunch = await tuiWindowManager.ensure(tuiInput);
 assert.equal(initialTuiLaunch.launched, true);
-const cachedTuiLaunch = await launchCodexTuiWindow(tuiInput, tuiConfig, launchTuiStub);
+const cachedTuiLaunch = await tuiWindowManager.ensure(tuiInput);
 assert.equal(cachedTuiLaunch.launched, false);
 assert.equal(tuiLaunchCount, 1);
 
 const recoveredRuntime = await runtimeHostManager.ensureExistingRuntime(targetRuntime.id);
 assert.equal(recoveredRuntime.status, "RUNNING");
 assert.equal(readinessChecks, 3);
-const relaunchedTui = await launchCodexTuiWindow(tuiInput, tuiConfig, launchTuiStub);
+const relaunchedTui = await tuiWindowManager.ensure(tuiInput);
 assert.equal(relaunchedTui.launched, true);
 assert.equal(tuiLaunchCount, 2);
 assert.equal(store.getLatestTurn(targetTask.id)?.status, "interrupted");
@@ -232,11 +250,11 @@ assert.equal(store.getTask(otherTask.id)?.status, "running");
 assert.equal(store.getQueueSnapshot(otherTask.id).running, 1);
 assert.equal(store.getQueueSnapshot(otherTask.id).interrupted, 0);
 const interruptedApproval = store.getApproval(targetApproval.id);
-assert.equal(interruptedApproval?.decision, "auto_denied");
+assert.equal(interruptedApproval?.decision, "orphaned");
 assert.equal(interruptedApproval?.decidedBy, "bridge");
 assert.equal(
   interruptedApproval?.decisionReason,
-  "Bridge automatically denied this pending approval because its Runtime Host was unreachable and treated as DEAD.",
+  "Approval was orphaned because its Runtime Host connection was lost; it cannot be answered on a replacement connection.",
 );
 assert.notEqual(interruptedApproval?.resolvedAt, null);
 assert.equal(store.getPendingApproval(targetTask.id), null);
@@ -245,11 +263,11 @@ assert.equal(store.getPendingApproval(otherTask.id)?.id, otherApproval.id);
 const targetEvents = store.listEvents(targetTask.id, 0, 20);
 assert.equal(targetEvents.some((event) => event.eventType === "codex_turn_interrupted"), true);
 assert.equal(targetEvents.some((event) => event.eventType === "task_command_interrupted"), true);
-const approvalEvent = targetEvents.find((event) => event.eventType === "approval_auto_denied");
+const approvalEvent = targetEvents.find((event) => event.eventType === "approval_orphaned");
 assert(approvalEvent);
 const approvalEventPayload = approvalEvent.payload as Record<string, unknown>;
 assert.equal(approvalEventPayload.approvalId, targetApproval.id);
-assert.equal(approvalEventPayload.decision, "auto_denied");
+assert.equal(approvalEventPayload.decision, "orphaned");
 assert.equal(approvalEventPayload.nextAction, "task_status");
 assert.equal(store.listEvents(otherTask.id, 0, 20).length, 0);
 
@@ -270,25 +288,28 @@ const summarizedEvents = await taskService.events({
   includePayload: false,
 });
 const approvalSummary = summarizedEvents.events.find(
-  (event) => event.eventType === "approval_auto_denied",
+  (event) => event.eventType === "approval_orphaned",
 );
 assert(approvalSummary && "summary" in approvalSummary);
 assert.equal(
   approvalSummary.summary,
-  "A pending approval was automatically denied after its Runtime Host was treated as DEAD.",
+  "A pending approval was orphaned after its Runtime Host connection was lost.",
 );
 assert.equal(approvalSummary.nextAction, "task_status");
 assert.deepEqual(approvalSummary.details, {
   approvalId: targetApproval.id,
-  decision: "auto_denied",
+  decision: "orphaned",
   decidedBy: "bridge",
   decisionReason:
-    "Bridge automatically denied this pending approval because its Runtime Host was unreachable and treated as DEAD.",
+    "Approval was orphaned because its Runtime Host connection was lost; it cannot be answered on a replacement connection.",
   resolvedAt: interruptedApproval?.resolvedAt,
 });
+const interruptedAttention = taskService.getPendingAttention(targetTask.id);
+assert.equal(interruptedAttention?.attention.kind, "interrupted");
 const started = await taskService.sendTask({
   taskId: targetTask.id,
   instruction: "Continue after automatic recovery.",
+  ackRevision: interruptedAttention?.attention.revision,
 });
 assert.equal(started.turnId, "turn_after_interruption");
 assert.equal(store.getLatestTurn(targetTask.id)?.status, "running");

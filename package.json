@@ -2,7 +2,7 @@
   "name": "codex-bridge-mcp",
   "version": "0.1.0",
   "private": true,
-  "description": "Codex Bridge MCP keeps Claude Code connected to one long-lived Codex App Server runtime and thread.",
+  "description": "A reliable local session layer for Claude or Codex to orchestrate long-lived Codex App Server tasks.",
   "type": "module",
   "bin": {
     "codex-bridge-mcp": "dist/index.js"
@@ -10,8 +10,9 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/copy-static-assets.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "dev": "tsx src/index.ts",
-    "start": "node dist/index.js",
+    "dev": "tsx src/daemon.ts",
+    "start": "node dist/daemon.js",
+    "start:stdio": "node dist/index.js",
     "generate:codex-types": "codex app-server generate-ts --experimental --out src/codex/generated && node scripts/fix-generated-imports.mjs",
     "check:forbidden": "node scripts/check-forbidden-runtime-spawns.mjs",
     "smoke:protocol": "tsx scripts/smoke-app-server-client.ts",
@@ -19,8 +20,12 @@
     "smoke:queue": "tsx scripts/smoke-queue-recovery.ts",
     "smoke:recovery": "tsx scripts/smoke-recovery.ts",
     "smoke:runtime-interruption": "tsx scripts/smoke-runtime-interruption.ts",
+    "smoke:project-session": "tsx scripts/smoke-project-session.ts",
+    "smoke:attention": "tsx scripts/smoke-attention-delivery.ts",
     "smoke:diff": "tsx scripts/smoke-diff-service.ts",
-    "smoke:mcp": "tsx scripts/smoke-mcp-stdio.ts",
+    "smoke:mcp:http": "tsx scripts/smoke-mcp-http.ts",
+    "smoke:mcp:stdio": "tsx scripts/smoke-mcp-stdio.ts",
+    "smoke:mcp": "npm run smoke:mcp:http && npm run smoke:mcp:stdio",
     "demo:claude": "tsx scripts/demo-claude-via-mcp.ts",
     "e2e:real": "tsx scripts/e2e-real-runtime.ts"
   },

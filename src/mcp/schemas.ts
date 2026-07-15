@@ -6,12 +6,21 @@ export const TaskOpenSchema = z.object({
   requirements: z.any(),
   acceptanceCriteria: z.array(z.string()).default([]),
   tokenBudget: z.number().int().positive().optional(),
+  mode: z.enum(["reuse", "new"]).default("reuse"),
 });
 
 export const TaskSendSchema = z.object({
   taskId: z.string().min(1),
   instruction: z.string().min(1),
   runChecks: z.boolean().default(false),
+  ackRevision: z.number().int().nonnegative().optional(),
+});
+
+export const TaskAwaitSchema = z.object({
+  taskId: z.string().min(1),
+  turnId: z.string().min(1).optional(),
+  afterRevision: z.number().int().nonnegative().default(0),
+  ackRevision: z.number().int().nonnegative().optional(),
 });
 
 export const TaskStatusSchema = z.object({

@@ -21,14 +21,22 @@ const endpoint = `ws://127.0.0.1:${address.port}`;
 
 const clientMessages: RpcMessage[] = [];
 let activeSocket: WebSocket | null = null;
+let connectionCount = 0;
 const responseWaiters = new Map<string | number, (message: RpcMessage) => void>();
 wss.on("connection", (socket) => {
+  connectionCount += 1;
   activeSocket = socket;
   socket.on("message", (raw) => {
     const message = JSON.parse(raw.toString("utf8")) as RpcMessage;
     clientMessages.push(message);
     handleClientMessage(socket, message);
     if (message.id !== undefined && ("result" in message || "error" in message)) {
+      socket.send(
+        JSON.stringify({
+          method: "serverRequest/resolved",
+          params: { threadId: "thread_mock", requestId: message.id },
+        }),
+      );
       responseWaiters.get(message.id)?.(message);
       responseWaiters.delete(message.id);
     }
@@ -36,7 +44,17 @@ wss.on("connection", (socket) => {
 });
 
 const client = new CodexAppServerClient(endpoint);
-await client.connect();
+await Promise.all([client.connect(), client.connect(), client.connect()]);
+assert.equal(connectionCount, 1, "Concurrent connect calls must share one App Server WebSocket");
+await Promise.all([
+  client.ensureThreadReady("thread_existing", process.cwd()),
+  client.ensureThreadReady("thread_existing", process.cwd()),
+]);
+assert.equal(
+  clientMessages.filter((message) => message.method === "thread/resume").length,
+  1,
+  "Concurrent recovery must resume a known thread only once",
+);
 
 const threadId = await client.threadStart({
   cwd: process.cwd(),
@@ -149,8 +167,9 @@ assert.deepEqual(threadStartRequest?.params?.config, {});
 assert.match(String(threadStartRequest?.params?.developerInstructions), /Keep execution minimal/);
 assert.match(String(threadStartRequest?.params?.developerInstructions), /task orchestrator/);
 assert.match(String(threadStartRequest?.params?.developerInstructions), /Keep tool output economical/);
-assert.match(String(threadStartRequest?.params?.developerInstructions), /required JSON self-report/);
-assert.equal(clientMessages.some((message) => message.method === "thread/resume"), false);
+assert.match(String(threadStartRequest?.params?.developerInstructions), /End every turn with one concise final message/);
+assert.doesNotMatch(String(threadStartRequest?.params?.developerInstructions), /JSON self-report|report\.json/);
+assert.equal(clientMessages.filter((message) => message.method === "thread/resume").length, 1);
 
 client.drop();
 await new Promise<void>((resolve) => wss.close(() => resolve()));
