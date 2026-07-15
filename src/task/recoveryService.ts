@@ -1,7 +1,7 @@
 import { CodexClientPool, type CodexAppServerClient } from "../codex/codexAppServerClient.js";
 import { config, type BridgeConfig } from "../config/config.js";
 import { RuntimeHostManager } from "../runtime/runtimeHostManager.js";
-import { launchCodexTuiWindow } from "../runtime/tuiWindowManager.js";
+import { TuiWindowManager } from "../runtime/tuiWindowManager.js";
 import { JsonlLogger } from "../storage/jsonlLogger.js";
 import { type RuntimeHostRecord, type TaskRecord, SqliteStore } from "../storage/sqlite.js";
 import { buildCodexDeveloperInstructions } from "./codexInstruction.js";
@@ -18,6 +18,7 @@ export class RecoveryService {
       runtime: RuntimeHostRecord,
       client: CodexAppServerClient,
     ) => void = () => undefined,
+    private readonly tuiWindowManager: TuiWindowManager = new TuiWindowManager(store, bridgeConfig),
   ) {}
 
   async recoverTask(taskId: string): Promise<{
@@ -37,6 +38,7 @@ export class RecoveryService {
     if (!task) {
       throw new Error(`taskId not found: ${taskId}`);
     }
+    const session = this.store.activateProjectSessionForTask(task);
     const runtime = await this.runtimeHostManager.recoverRuntime(task.runtimeHostId);
     const client = await this.clientPool.getOrConnect(runtime.endpoint);
     this.bindTaskRuntimeEvents(task, runtime, client);
@@ -45,14 +47,17 @@ export class RecoveryService {
       task.projectRoot,
       buildCodexDeveloperInstructions(),
     );
-    const codexTui = await launchCodexTuiWindow(
+    this.store.updateProjectSessionRuntime(session.id, runtime.id);
+    const activeSession = this.store.getProjectSessionById(session.id) ?? session;
+    const codexTui = await this.tuiWindowManager.ensure(
       {
+        sessionId: activeSession.id,
+        sessionGeneration: activeSession.generation,
         runtimeId: runtime.id,
         projectRoot: task.projectRoot,
         endpoint: runtime.endpoint,
         threadId: task.codexThreadId,
       },
-      this.bridgeConfig,
     ).catch((error: unknown) => ({
       launched: false,
       mode: "off" as const,
@@ -69,6 +74,8 @@ export class RecoveryService {
         type: "task_recovered",
         runtimeEndpoint: runtime.endpoint,
         codexThreadId: task.codexThreadId,
+        projectSessionId: activeSession.id,
+        sessionGeneration: activeSession.generation,
         codexTui,
       },
     });

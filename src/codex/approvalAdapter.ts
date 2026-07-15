@@ -12,7 +12,12 @@ export interface ApprovalContext {
 
 export function isApprovalRequest(notification: CodexNotification): boolean {
   const method = notification.method.toLowerCase();
-  if (method.includes("decision") || method.includes("resolved")) {
+  if (
+    method.includes("decision") ||
+    method.includes("resolved") ||
+    method.includes("autoapprovalreview") ||
+    method.includes("completed")
+  ) {
     return false;
   }
   return (

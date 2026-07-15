@@ -12,6 +12,35 @@ create table if not exists runtime_host (
   updated_at text not null
 );
 
+create table if not exists project_session (
+  id text primary key,
+  project_key text not null unique,
+  project_root text not null,
+  generation integer not null,
+  runtime_host_id text,
+  active_task_id text,
+  codex_thread_id text,
+  status text not null,
+  claim_token text,
+  claim_expires_at text,
+  created_at text not null,
+  updated_at text not null
+);
+
+create table if not exists tui_instance (
+  session_id text primary key,
+  generation integer not null,
+  runtime_endpoint text not null,
+  codex_thread_id text not null,
+  pid integer,
+  process_started_at text,
+  status text not null,
+  claim_token text,
+  claim_expires_at text,
+  created_at text not null,
+  updated_at text not null
+);
+
 create table if not exists task (
   id text primary key,
   title text not null,
@@ -45,6 +74,11 @@ create table if not exists turn (
   codex_turn_id text,
   status text not null,
   instruction text,
+  attention_revision integer not null default 0,
+  attention_ack_revision integer not null default 0,
+  attention_kind text,
+  attention_payload_json text,
+  result_json text,
   created_at text not null,
   updated_at text not null
 );
@@ -102,3 +136,5 @@ create table if not exists context_usage (
 create index if not exists idx_event_task_delivered on event(task_id, claude_delivered, seq);
 create index if not exists idx_approval_task_decision on approval(task_id, decision, created_at);
 create index if not exists idx_turn_task_created on turn(task_id, created_at);
+create index if not exists idx_project_session_runtime on project_session(runtime_host_id, status);
+create index if not exists idx_tui_instance_endpoint on tui_instance(runtime_endpoint, status);

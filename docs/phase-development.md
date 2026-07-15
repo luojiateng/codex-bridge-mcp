@@ -4,11 +4,11 @@ This document is the working implementation plan. It preserves every product req
 
 ## 1. Product Contract
 
-Codex Bridge MCP is a local reliable session layer between Claude Code CLI and Codex CLI/App Server.
+Codex Bridge MCP is a local reliable session layer between a task orchestrator (Claude Code or Codex) and Codex CLI/App Server.
 
 Roles:
 
-- Claude Code CLI: task brain. It talks with the user, clarifies requirements, breaks work down, decides approvals, and reviews results.
+- Task orchestrator: task brain. It talks with the user, clarifies requirements, breaks work down, decides approvals, and reviews results.
 - Codex CLI / Codex App Server: execution engine. It edits code, runs commands, executes tests, and reports results.
 - Codex Bridge MCP: reliable session layer. It binds sessions, keeps Codex Runtime alive, brokers approvals, persists events, restores after disconnects, and keeps audit logs.
 
@@ -22,10 +22,11 @@ They must not reopen cmd or PowerShell through codex resume.
 ## 2. Non-Negotiable Constraints
 
 - One `projectRoot` has at most one active Runtime Host.
+- One normalized `projectRoot` has one durable active Project Session by default.
 - One Runtime Host has one long-lived `codex app-server` process.
 - One large task has one `codexThreadId`.
 - One `taskId` must never bind to multiple `codexThreadId` values.
-- `task_open` may call `thread/start`.
+- `task_open` may call `thread/start` only when no active Project Session exists or `mode=new` is explicit.
 - `task_send` may call only `turn/start` in the normal path.
 - `thread/resume` is allowed only for Runtime recovery or when the known thread is not loaded after reconnect.
 - `task_send` must not spawn `codex resume`.
@@ -45,7 +46,7 @@ They must not reopen cmd or PowerShell through codex resume.
 Deliverables:
 
 - TypeScript project under `codex-bridge-mcp`.
-- MCP stdio server entrypoint.
+- MCP Streamable HTTP server entrypoint backed by one long-lived local Bridge Core.
 - Storage schema and JSONL logger.
 - Protocol placeholders for generated Codex App Server schemas.
 - Forbidden spawn scanner.
@@ -85,7 +86,11 @@ Deliverables:
 - `task_open`.
 - `task_send`.
 - `task_status`.
+- `task_await` for cancellation/reconnect recovery without model-level polling.
+- Durable attention ACK revision and replay of the latest unacknowledged turn attention.
 - Task table.
+- Project Session table with cross-process creation claims.
+- Canonical Windows project-root identity.
 - Turn table.
 - Queue lock per task/thread/runtime.
 - `thread/start`.
@@ -96,6 +101,9 @@ Acceptance:
 
 - One `taskId` has exactly one `codexThreadId`.
 - Multiple `task_send` calls keep the same `codexThreadId`.
+- Repeated or concurrent `task_open(mode=reuse)` calls return the same `taskId` and `codexThreadId` and issue only one `thread/start`.
+- Reconnecting or replacing an MCP client session does not lose the active Project Session or restart Bridge lifecycle recovery.
+- Cancelling a pending MCP request does not consume its completion; the latest unacknowledged attention is replayed after reconnect.
 - Codex can use previous turn context in the same thread.
 
 ### Phase 3 - Approval Broker
@@ -105,16 +113,19 @@ Deliverables:
 - Approval event detection.
 - Server-initiated JSON-RPC request detection.
 - Approval table.
+- Persistent turn attention state (`awaiting_approval` plus monotonic attention revision).
+- Explicit attention ACK after the orchestrator completes the corresponding approval/review/continue action.
 - Approval JSONL log.
 - `approval_decide`.
-- Claude-visible pending approval in `task_status` and `task_events`.
+- Approval delivery through the pending `task_send` / `approval_decide` MCP call; `task_status` and `task_events` remain diagnostic surfaces.
 - Response mapping for command/file-change/legacy approval requests.
 
 Acceptance:
 
 - High-risk Codex actions are persisted as pending approval requests.
 - Bridge does not auto-approve.
-- Claude can approve or deny with a reason.
+- The task orchestrator can approve or deny with a reason.
+- A duplicate App Server approval request is persisted and delivered only once.
 - The decision is forwarded to Codex App Server and logged.
 - `item/commandExecution/requestApproval` and `item/fileChange/requestApproval` are answered by JSON-RPC response, not by a made-up follow-up method.
 
@@ -138,16 +149,18 @@ Deliverables:
 
 Acceptance:
 
-- Claude receives completion.
-- Claude calls `task_diff`.
-- Claude compares the diff against requirements and acceptance criteria.
-- If incomplete, Claude sends another `task_send`.
+- The task orchestrator receives terminal attention from the pending MCP call.
+- Long pending calls emit compact progress heartbeats without raw Codex output.
+- The task orchestrator calls `task_diff`.
+- The task orchestrator compares the diff against requirements and acceptance criteria.
+- If incomplete, the task orchestrator sends another `task_send`.
 
 ### Phase 5 - Disconnect Recovery
 
 Deliverables:
 
-- Claude restart recovery through `task_events` and `task_status`.
+- MCP cancellation/reconnect recovery through `task_await` and the persisted attention revision.
+- Durable replay until attention ACK, independent of the original in-memory MCP waiter.
 - Bridge restart recovery by reconnecting existing Runtime Host endpoint.
 - Runtime death or computer reboot recovery by starting a new App Server and calling `thread/resume`.
 - `task_recover`.
@@ -156,13 +169,37 @@ Acceptance:
 
 - Bridge restart does not open a second window if the existing App Server is alive.
 - Computer reboot opens a new Runtime Host but resumes the same Codex thread.
-- Missed events are returned to Claude as undelivered events.
+- The latest unacknowledged attention is returned to the orchestrator after reconnect; older acknowledged turns are not replayed.
+
+### Phase 5.5 - Bridge Core Lifecycle Ownership
+
+Scope:
+
+- One loopback Streamable HTTP Bridge Core owns SQLite, Runtime/App Server WebSockets, task queues, Project Sessions, TUI instances, turns and approvals.
+- The stable `dist/index.js` stdio entrypoint is a stateless adapter: it starts the Core only when absent, proxies MCP tool calls, and never runs startup recovery or owns Runtime connections.
+- Direct Streamable HTTP clients and any number of stdio adapters share that same Core.
+- Core startup acquires the HTTP listener before opening durable state, then transitions `STARTING -> RECONCILING -> READY`.
+- The Core health contract exposes protocol/build identity; a stdio Adapter rejects an incompatible running Core instead of silently reusing or killing it.
+- Core shutdown stops accepting requests, closes MCP sessions, closes every App Server WebSocket, and finally closes SQLite.
+- Startup recovery uses `thread/read` to reconcile locally active turns with App Server state.
+- Pending approvals from a previous App Server connection become `orphaned`; Bridge never fabricates an approve/deny response on a replacement connection.
+- Project Session generation advances when its Runtime becomes unrecoverable, invalidating the old TUI ownership record.
+- SQLite enforces at most one active turn and one running queued command per task.
+- Raw output/delta notifications are not inserted into the event table; only recoverable semantic facts are persisted.
+
+Acceptance:
+
+- Two simultaneous MCP clients share one Core and remain usable when either client disconnects.
+- Existing Codex and Claude stdio configurations initialize through `dist/index.js` without a separately managed Core terminal.
+- A second Core cannot acquire the configured loopback port and therefore cannot touch the same lifecycle state.
+- Core restart does not create a new Codex thread and does not leave a previous-connection approval actionable.
+- Delta-heavy Codex output does not grow the SQLite event stream.
 
 ### Phase 6 - Token And Context Governance
 
 Deliverables:
 
-- Token usage event capture when app-server emits `thread/tokenUsage/updated`.
+- Token usage snapshot capture when app-server emits `thread/tokenUsage/updated`; raw usage/delta notifications are not retained as audit events.
 - Compact `context_usage` snapshot table keyed by `task_id`.
 - `task_status.context` warning at 70%.
 - `context_near_limit` event at 85%, emitted once per task until future policy changes reset it.
@@ -187,12 +224,15 @@ Deliverables:
 - Optional Codex remote TUI window launched after `task_open`.
 - Default TUI mode attaches to the opened task thread through the same App Server endpoint.
 - TUI launch result is persisted as task events.
-- TUI launch failure does not break the Bridge execution path.
+- TUI ownership and launch claims are persisted in SQLite instead of a process-local cache.
+- `task_open` may report a TUI launch failure without discarding the durable session; in visible TUI modes, `task_send` must not start a turn unless the TUI is running.
 - `task_send` still uses only App Server `turn/start` and never uses the TUI process for execution.
 
 Acceptance:
 
 - Opening a task starts or reuses one App Server Runtime Host and opens one visible Codex TUI window for the task thread.
+- Reopening the same project, including from another MCP process, reuses the persisted TUI instance.
+- If the persisted TUI process exited between turns, the next `task_send` relaunches it before `turn/start`; a relaunch failure blocks the turn instead of running silently in the background.
 - Claude follow-up turns continue through WebSocket `turn/start`.
 - Disabling the TUI through `CODEX_BRIDGE_CODEX_TUI_MODE=off` keeps headless behavior for automation.
 
@@ -204,7 +244,10 @@ Deliverables:
 - README setup steps.
 - Manual acceptance checklist.
 - Forbidden spawn scanner wired into CI/local checks.
-- MCP stdio smoke test that lists the final 9-tool surface through the MCP SDK.
+- Streamable HTTP multi-client smoke test that lists the final 10-tool surface through the MCP SDK and proves one Core survives client disconnects.
+- Compiled stdio adapter smoke test that starts two clients, proves they share one auto-started Core PID, and proves the Core outlives both adapters.
+- Attention delivery smoke test that proves approval idempotency and approval-to-completion waiting without model-level polling.
+- Project Session smoke test that proves concurrent open, MCP restart reuse, path normalization, explicit session rotation, and TUI revalidation before follow-up turns.
 - Real Runtime Host E2E that verifies one runtime endpoint and one task thread across two turns.
 - Bridge restart recovery smoke test that reconnects an already-alive endpoint and calls `thread/resume` without `thread/start`.
 - Runtime Host startup log split into `.host.log`, `.host.stdout.log`, and `.host.stderr.log` so the window stays readable on the rare occasion it's made visible.
@@ -212,7 +255,7 @@ Deliverables:
 
 Acceptance:
 
-- A real Claude Code MCP session can call all 9 tools.
+- A real Claude Code or Codex MCP session can call all 10 tools.
 - A real Codex Runtime Host process is reused across multiple turns.
 - All forbidden items remain absent.
 - The compiled MCP can initialize SQLite from `dist/` because static schema assets are copied during build.
@@ -237,8 +280,8 @@ Acceptance:
 | Approval forwarding to Claude | ApprovalAdapter and ApprovalService |
 | No automatic approval | ApprovalService policy |
 | Events persisted and replayable | EventStore and JSONL logger |
-| Claude restart recovery | `task_events` |
-| Bridge restart runtime reconnect | RuntimeHostManager |
+| Claude/Codex client reconnect | Persisted attention revision/ACK, pending replay and `task_await` on the same Bridge Core |
+| Bridge restart runtime reconnect | BridgeCore reconciliation plus RuntimeHostManager |
 | Computer reboot recovery | `task_recover` and `thread/resume` |
 | Task discovery when Claude loses a taskId | `task_list` |
 | Token governance | CompactService and event normalizer |

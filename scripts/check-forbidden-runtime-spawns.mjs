@@ -38,6 +38,18 @@ for (const pattern of forbiddenTaskSendSpawns) {
   }
 }
 
+const tuiManagerPath = path.join(src, "runtime", "tuiWindowManager.ts");
+const tuiManagerText = fs.readFileSync(tuiManagerPath, "utf8");
+if (/Start-Process/i.test(tuiManagerText)) {
+  findings.push("src/runtime/tuiWindowManager.ts must launch exactly one TUI process directly");
+}
+
+const scriptBuilderPath = path.join(src, "runtime", "powershellScriptBuilder.ts");
+const scriptBuilderText = fs.readFileSync(scriptBuilderPath, "utf8");
+if (/maxAttempts|retrying in \$retryDelaySeconds/i.test(scriptBuilderText)) {
+  findings.push("src/runtime/powershellScriptBuilder.ts must not retry Codex TUI process launches");
+}
+
 if (findings.length > 0) {
   console.error("Forbidden Codex resume/runtime spawn patterns found:");
   for (const finding of findings) {

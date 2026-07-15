@@ -9,11 +9,12 @@ import {
   SqliteStore,
 } from "../storage/sqlite.js";
 import { createRuntimeId, nowIso } from "../shared/id.js";
+import { canonicalizeProjectRoot } from "../shared/projectRoot.js";
 import { CodexClientPool } from "../codex/codexAppServerClient.js";
 import { allocateStablePort } from "./portAllocator.js";
 import { isHttpReady, waitForHttpReady } from "./heartbeat.js";
 import { writeRuntimeScript } from "./powershellScriptBuilder.js";
-import { invalidateCodexTuiWindows } from "./tuiWindowManager.js";
+import { TuiWindowManager } from "./tuiWindowManager.js";
 
 export class RuntimeHostManager {
   private readonly ensuringByProjectRoot = new Map<string, Promise<RuntimeHostRecord>>();
@@ -23,10 +24,14 @@ export class RuntimeHostManager {
     private readonly logger: JsonlLogger,
     private readonly clientPool: CodexClientPool,
     private readonly bridgeConfig: BridgeConfig = config,
+    private readonly tuiWindowManager: TuiWindowManager = new TuiWindowManager(
+      store,
+      bridgeConfig,
+    ),
   ) {}
 
   async ensureRuntimeHost(projectRoot: string): Promise<RuntimeHostRecord> {
-    const normalizedProjectRoot = path.resolve(projectRoot);
+    const normalizedProjectRoot = canonicalizeProjectRoot(projectRoot).projectRoot;
     const existingEnsure = this.ensuringByProjectRoot.get(normalizedProjectRoot);
     if (existingEnsure) {
       return existingEnsure;
@@ -62,7 +67,8 @@ export class RuntimeHostManager {
       }
 
       await this.transition(existing, "DEAD");
-      invalidateCodexTuiWindows(existing.endpoint);
+      this.store.markProjectSessionsRecovering(existing.id);
+      await this.tuiWindowManager.invalidateEndpoint(existing.endpoint);
       await this.interruptRuntimeDependents(
         existing.id,
         "Runtime Host was unreachable and marked DEAD; its running work was interrupted before recreation.",
@@ -157,9 +163,9 @@ export class RuntimeHostManager {
         runtimeHostId,
         codexThreadId: approval.codexThreadId,
         codexTurnId: approval.codexTurnId,
-        eventType: "approval_auto_denied",
+        eventType: "approval_orphaned",
         payload: {
-          type: "approval_auto_denied",
+          type: "approval_orphaned",
           approvalId: approval.id,
           decision: approval.decision,
           decidedBy: approval.decidedBy,

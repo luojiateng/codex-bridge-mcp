@@ -1,5 +1,8 @@
 import { spawn } from "node:child_process";
 import { config, type BridgeConfig } from "../config/config.js";
+import { createId, nowIso } from "../shared/id.js";
+import { SqliteStore } from "../storage/sqlite.js";
+import { delay } from "./heartbeat.js";
 import { writeCodexTuiScript } from "./powershellScriptBuilder.js";
 
 export interface CodexTuiWindowInput {
@@ -7,6 +10,11 @@ export interface CodexTuiWindowInput {
   projectRoot: string;
   endpoint: string;
   threadId: string;
+}
+
+export interface ManagedCodexTuiWindowInput extends CodexTuiWindowInput {
+  sessionId: string;
+  sessionGeneration: number;
 }
 
 export interface CodexTuiWindowResult {
@@ -17,7 +25,136 @@ export interface CodexTuiWindowResult {
   reason?: string;
 }
 
-const launchedThreads = new Map<string, number | null>();
+type LaunchScript = (scriptPath: string, projectRoot: string) => Promise<number | null>;
+
+export interface TuiProcessController {
+  isAlive(pid: number | null): boolean;
+  terminate(pid: number): void;
+}
+
+const defaultProcessController: TuiProcessController = {
+  isAlive: isProcessAlive,
+  terminate: terminateOwnedProcess,
+};
+
+const TUI_CLAIM_LEASE_MS = 30_000;
+const TUI_WAIT_INTERVAL_MS = 50;
+
+export class TuiWindowManager {
+  constructor(
+    private readonly store: SqliteStore,
+    private readonly bridgeConfig: BridgeConfig = config,
+    private readonly launchScript: LaunchScript = launchVisiblePowerShellScript,
+    private readonly processController: TuiProcessController = defaultProcessController,
+  ) {}
+
+  async ensure(input: ManagedCodexTuiWindowInput): Promise<CodexTuiWindowResult> {
+    if (this.bridgeConfig.codexTuiMode === "off") {
+      return {
+        launched: false,
+        mode: "off",
+        pid: null,
+        reason: "Codex TUI window is disabled.",
+      };
+    }
+
+    const claimToken = createId("tui_claim");
+    const deadline = Date.now() + TUI_CLAIM_LEASE_MS + 5_000;
+    while (Date.now() < deadline) {
+      const existing = this.store.getTuiInstance(input.sessionId);
+      const sameTarget =
+        existing?.generation === input.sessionGeneration &&
+        existing.runtimeEndpoint === input.endpoint &&
+        existing.codexThreadId === input.threadId;
+      if (
+        existing?.status === "RUNNING" &&
+        sameTarget &&
+        this.processController.isAlive(existing.pid)
+      ) {
+        return {
+          launched: false,
+          mode: this.bridgeConfig.codexTuiMode,
+          pid: existing.pid,
+          reason: "Codex TUI window is already running for this project session.",
+        };
+      }
+
+      if (existing?.pid && this.processController.isAlive(existing.pid)) {
+        this.processController.terminate(existing.pid);
+        await delay(100);
+      }
+
+      const claim = this.store.claimTuiLaunch({
+        sessionId: input.sessionId,
+        generation: input.sessionGeneration,
+        runtimeEndpoint: input.endpoint,
+        codexThreadId: input.threadId,
+        claimToken,
+        claimExpiresAt: new Date(Date.now() + TUI_CLAIM_LEASE_MS).toISOString(),
+      });
+      if (claim.outcome === "wait") {
+        await delay(TUI_WAIT_INTERVAL_MS);
+        continue;
+      }
+
+      try {
+        const result = await launchCodexTuiWindow(input, this.bridgeConfig, this.launchScript);
+        this.store.completeTuiLaunch({
+          sessionId: input.sessionId,
+          claimToken,
+          pid: result.pid,
+          processStartedAt: nowIso(),
+        });
+        return result;
+      } catch (error) {
+        this.store.failTuiLaunch(input.sessionId, claimToken);
+        throw error;
+      }
+    }
+
+    throw new Error(`Timed out waiting for Codex TUI launch: ${input.sessionId}`);
+  }
+
+  async invalidateEndpoint(endpoint: string): Promise<void> {
+    const staleInstances = this.store.markTuiInstancesStale(endpoint);
+    for (const instance of staleInstances) {
+      if (instance.pid && this.processController.isAlive(instance.pid)) {
+        this.processController.terminate(instance.pid);
+      }
+    }
+  }
+}
+
+export async function launchCodexTuiWindow(
+  input: CodexTuiWindowInput,
+  bridgeConfig: BridgeConfig = config,
+  launchScript: LaunchScript = launchVisiblePowerShellScript,
+): Promise<CodexTuiWindowResult> {
+  if (bridgeConfig.codexTuiMode === "off") {
+    return {
+      launched: false,
+      mode: "off",
+      pid: null,
+      reason: "Codex TUI window is disabled.",
+    };
+  }
+
+  const scriptPath = await writeCodexTuiScript({
+    runtimeScriptsDir: bridgeConfig.runtimeScriptsDir,
+    projectRoot: input.projectRoot,
+    runtimeId: input.runtimeId,
+    endpoint: input.endpoint,
+    threadId: input.threadId,
+    mode: bridgeConfig.codexTuiMode,
+  });
+  const pid = await launchScript(scriptPath, input.projectRoot);
+  return {
+    launched: true,
+    mode: bridgeConfig.codexTuiMode,
+    pid,
+    scriptPath,
+  };
+}
 
 function isProcessAlive(pid: number | null): boolean {
   if (pid === null) {
@@ -31,105 +168,31 @@ function isProcessAlive(pid: number | null): boolean {
   }
 }
 
-export async function launchCodexTuiWindow(
-  input: CodexTuiWindowInput,
-  bridgeConfig: BridgeConfig = config,
-  launchScript: (
-    scriptPath: string,
-    projectRoot: string,
-  ) => Promise<number | null> = launchVisiblePowerShellScript,
-): Promise<CodexTuiWindowResult> {
-  if (bridgeConfig.codexTuiMode === "off") {
-    return {
-      launched: false,
-      mode: "off",
-      pid: null,
-      reason: "Codex TUI window is disabled.",
-    };
-  }
-
-  const key = `${input.endpoint}:${input.threadId}`;
-  const existingPid = launchedThreads.get(key);
-  if (existingPid !== undefined && isProcessAlive(existingPid)) {
-    return {
-      launched: false,
-      mode: bridgeConfig.codexTuiMode,
-      pid: existingPid,
-      reason: "Codex TUI window is already running for this thread.",
-    };
-  }
-
-  const scriptPath = await writeCodexTuiScript({
-    runtimeScriptsDir: bridgeConfig.runtimeScriptsDir,
-    projectRoot: input.projectRoot,
-    runtimeId: input.runtimeId,
-    endpoint: input.endpoint,
-    threadId: input.threadId,
-    mode: bridgeConfig.codexTuiMode,
-  });
-  const pid = await launchScript(scriptPath, input.projectRoot);
-  launchedThreads.set(key, pid);
-  return {
-    launched: true,
-    mode: bridgeConfig.codexTuiMode,
-    pid,
-    scriptPath,
-  };
-}
-
-export function invalidateCodexTuiWindows(endpoint: string): void {
-  const keyPrefix = `${endpoint}:`;
-  for (const key of launchedThreads.keys()) {
-    if (key.startsWith(keyPrefix)) {
-      launchedThreads.delete(key);
-    }
+function terminateOwnedProcess(pid: number): void {
+  try {
+    process.kill(pid);
+  } catch {
+    // The process may have exited between the liveness check and termination.
   }
 }
 
 function launchVisiblePowerShellScript(scriptPath: string, projectRoot: string): Promise<number | null> {
-  const command = [
-    `$ErrorActionPreference = "Stop"`,
-    `$scriptPath = ${psString(scriptPath)}`,
-    `$projectRoot = ${psString(projectRoot)}`,
-    `$args = @("-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $scriptPath)`,
-    `$process = Start-Process -FilePath "powershell.exe" -ArgumentList $args -WorkingDirectory $projectRoot -WindowStyle Normal -PassThru`,
-    `Write-Output $process.Id`,
-  ].join("; ");
-
   return new Promise((resolve, reject) => {
-    const launcher = spawn(
+    const tuiProcess = spawn(
       "powershell.exe",
-      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath],
       {
         cwd: projectRoot,
-        windowsHide: true,
-        stdio: ["ignore", "pipe", "pipe"],
+        detached: true,
+        windowsHide: false,
+        stdio: "ignore",
       },
     );
-    let stdout = "";
-    let stderr = "";
-    launcher.stdout?.on("data", (chunk) => {
-      stdout += chunk.toString("utf8");
-    });
-    launcher.stderr?.on("data", (chunk) => {
-      stderr += chunk.toString("utf8");
-    });
-    launcher.once("error", reject);
-    launcher.once("exit", (code, signal) => {
-      if (code !== 0) {
-        reject(
-          new Error(
-            `Codex TUI launcher failed: code=${String(code)} signal=${String(signal)} stderr=${stderr.trim()}`,
-          ),
-        );
-        return;
-      }
-      const pid = Number.parseInt(stdout.trim(), 10);
-      resolve(Number.isFinite(pid) ? pid : null);
+    tuiProcess.once("error", reject);
+    tuiProcess.once("spawn", () => {
+      const pid = tuiProcess.pid ?? null;
+      tuiProcess.unref();
+      resolve(pid);
     });
   });
-}
-
-function psString(value: string): string {
-  return `'${value.replace(/'/g, "''")}'`;
 }

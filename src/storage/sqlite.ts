@@ -2,8 +2,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
-import { nowIso } from "../shared/id.js";
+import { createId, nowIso } from "../shared/id.js";
 import { fromJson, toJson } from "../shared/json.js";
+import { canonicalizeProjectRoot } from "../shared/projectRoot.js";
 
 export type RuntimeStatus =
   | "INIT"
@@ -24,6 +25,46 @@ export interface RuntimeHostRecord {
   status: RuntimeStatus;
   startedAt: string | null;
   lastHeartbeatAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type ProjectSessionStatus = "CREATING" | "ACTIVE" | "RECOVERING" | "FAILED";
+
+export interface ProjectSessionRecord {
+  id: string;
+  projectKey: string;
+  projectRoot: string;
+  generation: number;
+  runtimeHostId: string | null;
+  activeTaskId: string | null;
+  codexThreadId: string | null;
+  status: ProjectSessionStatus;
+  claimToken: string | null;
+  claimExpiresAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type ProjectSessionClaimOutcome = "create" | "reuse" | "wait";
+
+export interface ProjectSessionClaim {
+  outcome: ProjectSessionClaimOutcome;
+  session: ProjectSessionRecord;
+}
+
+export type TuiInstanceStatus = "LAUNCHING" | "RUNNING" | "STALE" | "FAILED";
+
+export interface TuiInstanceRecord {
+  sessionId: string;
+  generation: number;
+  runtimeEndpoint: string;
+  codexThreadId: string;
+  pid: number | null;
+  processStartedAt: string | null;
+  status: TuiInstanceStatus;
+  claimToken: string | null;
+  claimExpiresAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -50,6 +91,11 @@ export interface TurnRecord {
   codexTurnId: string | null;
   status: string;
   instruction: string | null;
+  attentionRevision: number;
+  attentionAckRevision: number;
+  attentionKind: string | null;
+  attentionPayload: unknown;
+  result: unknown;
   createdAt: string;
   updatedAt: string;
 }
@@ -131,6 +177,11 @@ export interface RuntimeDependentsInterrupted {
   approvals: ApprovalRecord[];
 }
 
+export interface OrphanedRuntimeApprovals {
+  turns: TurnRecord[];
+  approvals: ApprovalRecord[];
+}
+
 type RuntimeHostRow = {
   id: string;
   project_root: string;
@@ -141,6 +192,35 @@ type RuntimeHostRow = {
   status: RuntimeStatus;
   started_at: string | null;
   last_heartbeat_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type ProjectSessionRow = {
+  id: string;
+  project_key: string;
+  project_root: string;
+  generation: number;
+  runtime_host_id: string | null;
+  active_task_id: string | null;
+  codex_thread_id: string | null;
+  status: ProjectSessionStatus;
+  claim_token: string | null;
+  claim_expires_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type TuiInstanceRow = {
+  session_id: string;
+  generation: number;
+  runtime_endpoint: string;
+  codex_thread_id: string;
+  pid: number | null;
+  process_started_at: string | null;
+  status: TuiInstanceStatus;
+  claim_token: string | null;
+  claim_expires_at: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -167,6 +247,11 @@ type TurnRow = {
   codex_turn_id: string | null;
   status: string;
   instruction: string | null;
+  attention_revision: number;
+  attention_ack_revision: number;
+  attention_kind: string | null;
+  attention_payload_json: string | null;
+  result_json: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -237,9 +322,14 @@ export class SqliteStore {
   constructor(dbPath: string) {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new Database(dbPath);
-    this.db.pragma("journal_mode = WAL");
-    this.db.pragma("foreign_keys = ON");
-    this.initSchema();
+    try {
+      this.db.pragma("journal_mode = WAL");
+      this.db.pragma("foreign_keys = ON");
+      this.initSchema();
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
   }
 
   close(): void {
@@ -247,6 +337,7 @@ export class SqliteStore {
   }
 
   saveRuntime(runtime: RuntimeHostRecord): void {
+    const canonicalProjectRoot = canonicalizeProjectRoot(runtime.projectRoot).projectRoot;
     this.db
       .prepare(
         `
@@ -269,7 +360,7 @@ export class SqliteStore {
           updated_at = excluded.updated_at
         `,
       )
-      .run(runtime);
+      .run({ ...runtime, projectRoot: canonicalProjectRoot });
   }
 
   findRuntimeByProjectRoot(projectRoot: string): RuntimeHostRecord | null {
@@ -291,6 +382,457 @@ export class SqliteStore {
       .prepare("select * from runtime_host order by created_at asc")
       .all() as RuntimeHostRow[];
     return rows.map(runtimeFromRow);
+  }
+
+  getProjectSessionByKey(projectKey: string): ProjectSessionRecord | null {
+    const row = this.db
+      .prepare("select * from project_session where project_key = ?")
+      .get(projectKey) as ProjectSessionRow | undefined;
+    return row ? projectSessionFromRow(row) : null;
+  }
+
+  getProjectSessionById(sessionId: string): ProjectSessionRecord | null {
+    const row = this.db
+      .prepare("select * from project_session where id = ?")
+      .get(sessionId) as ProjectSessionRow | undefined;
+    return row ? projectSessionFromRow(row) : null;
+  }
+
+  claimProjectSession(input: {
+    projectKey: string;
+    projectRoot: string;
+    mode: "reuse" | "new";
+    claimToken: string;
+    claimExpiresAt: string;
+    joinGeneration?: number;
+  }): ProjectSessionClaim {
+    const tx = this.db.transaction((): ProjectSessionClaim => {
+      const now = nowIso();
+      const row = this.db
+        .prepare("select * from project_session where project_key = ?")
+        .get(input.projectKey) as ProjectSessionRow | undefined;
+      if (!row) {
+        const session: ProjectSessionRecord = {
+          id: createId("session"),
+          projectKey: input.projectKey,
+          projectRoot: input.projectRoot,
+          generation: 1,
+          runtimeHostId: null,
+          activeTaskId: null,
+          codexThreadId: null,
+          status: "CREATING",
+          claimToken: input.claimToken,
+          claimExpiresAt: input.claimExpiresAt,
+          createdAt: now,
+          updatedAt: now,
+        };
+        this.db
+          .prepare(
+            `
+            insert into project_session (
+              id, project_key, project_root, generation, runtime_host_id,
+              active_task_id, codex_thread_id, status, claim_token,
+              claim_expires_at, created_at, updated_at
+            ) values (
+              @id, @projectKey, @projectRoot, @generation, @runtimeHostId,
+              @activeTaskId, @codexThreadId, @status, @claimToken,
+              @claimExpiresAt, @createdAt, @updatedAt
+            )
+            `,
+          )
+          .run(session);
+        return { outcome: "create", session };
+      }
+
+      const existing = projectSessionFromRow(row);
+      if (existing.status === "CREATING") {
+        const claimAlive = Date.parse(existing.claimExpiresAt ?? "") > Date.now();
+        if (claimAlive && existing.claimToken !== input.claimToken) {
+          return { outcome: "wait", session: existing };
+        }
+        const generation = input.joinGeneration ?? existing.generation;
+        this.db
+          .prepare(
+            `
+            update project_session
+            set project_root = ?, generation = ?, status = 'CREATING',
+                claim_token = ?, claim_expires_at = ?, updated_at = ?
+            where id = ?
+            `,
+          )
+          .run(
+            input.projectRoot,
+            generation,
+            input.claimToken,
+            input.claimExpiresAt,
+            now,
+            existing.id,
+          );
+        return {
+          outcome: "create",
+          session: {
+            ...existing,
+            projectRoot: input.projectRoot,
+            generation,
+            status: "CREATING",
+            claimToken: input.claimToken,
+            claimExpiresAt: input.claimExpiresAt,
+            updatedAt: now,
+          },
+        };
+      }
+
+      if (
+        input.joinGeneration !== undefined &&
+        existing.generation === input.joinGeneration &&
+        existing.status === "ACTIVE"
+      ) {
+        return { outcome: "reuse", session: existing };
+      }
+      if (input.mode === "reuse" && existing.status === "ACTIVE") {
+        return { outcome: "reuse", session: existing };
+      }
+      if (
+        input.mode === "reuse" &&
+        existing.status === "RECOVERING" &&
+        existing.activeTaskId &&
+        existing.codexThreadId
+      ) {
+        return { outcome: "reuse", session: existing };
+      }
+
+      if (input.mode === "new" && existing.activeTaskId) {
+        const activeTurn = this.db
+          .prepare("select status from turn where task_id = ? order by created_at desc limit 1")
+          .get(existing.activeTaskId) as { status: string } | undefined;
+        if (activeTurn && ["running", "awaiting_approval"].includes(activeTurn.status)) {
+          throw new Error(
+            `Cannot open a new project session while task ${existing.activeTaskId} has an active turn.`,
+          );
+        }
+      }
+
+      const generation =
+        input.joinGeneration ?? (input.mode === "new" ? existing.generation + 1 : existing.generation);
+      this.db
+        .prepare(
+          `
+          update project_session
+          set project_root = ?, generation = ?, status = 'CREATING',
+              claim_token = ?, claim_expires_at = ?, updated_at = ?
+          where id = ?
+          `,
+        )
+        .run(
+          input.projectRoot,
+          generation,
+          input.claimToken,
+          input.claimExpiresAt,
+          now,
+          existing.id,
+        );
+      return {
+        outcome: "create",
+        session: {
+          ...existing,
+          projectRoot: input.projectRoot,
+          generation,
+          status: "CREATING",
+          claimToken: input.claimToken,
+          claimExpiresAt: input.claimExpiresAt,
+          updatedAt: now,
+        },
+      };
+    });
+    return tx();
+  }
+
+  completeProjectSessionClaim(input: {
+    sessionId: string;
+    claimToken: string;
+    task: TaskRecord;
+  }): ProjectSessionRecord {
+    const tx = this.db.transaction((): ProjectSessionRecord => {
+      const now = nowIso();
+      const claim = this.db
+        .prepare(
+          "select id from project_session where id = ? and status = 'CREATING' and claim_token = ?",
+        )
+        .get(input.sessionId, input.claimToken);
+      if (!claim) {
+        throw new Error(`Project session claim was lost before completion: ${input.sessionId}`);
+      }
+      this.saveTask(input.task);
+      this.db
+        .prepare(
+          `
+          update project_session
+          set runtime_host_id = ?, active_task_id = ?, codex_thread_id = ?,
+              status = 'ACTIVE', claim_token = null, claim_expires_at = null, updated_at = ?
+          where id = ?
+          `,
+        )
+        .run(
+          input.task.runtimeHostId,
+          input.task.id,
+          input.task.codexThreadId,
+          now,
+          input.sessionId,
+        );
+      const session = this.getProjectSessionById(input.sessionId);
+      if (!session) {
+        throw new Error(`Project session disappeared after completion: ${input.sessionId}`);
+      }
+      return session;
+    });
+    return tx();
+  }
+
+  failProjectSessionClaim(sessionId: string, claimToken: string): void {
+    this.db
+      .prepare(
+        `
+        update project_session
+        set status = case when active_task_id is null then 'FAILED' else 'ACTIVE' end,
+            claim_token = null, claim_expires_at = null, updated_at = ?
+        where id = ? and status = 'CREATING' and claim_token = ?
+        `,
+      )
+      .run(nowIso(), sessionId, claimToken);
+  }
+
+  updateProjectSessionRuntime(sessionId: string, runtimeHostId: string): void {
+    this.db
+      .prepare(
+        `
+        update project_session
+        set runtime_host_id = ?, status = 'ACTIVE', updated_at = ?
+        where id = ?
+        `,
+      )
+      .run(runtimeHostId, nowIso(), sessionId);
+  }
+
+  activateProjectSessionForTask(task: TaskRecord): ProjectSessionRecord {
+    const canonical = canonicalizeProjectRoot(task.projectRoot);
+    const tx = this.db.transaction((): ProjectSessionRecord => {
+      const existing = this.getProjectSessionByKey(canonical.projectKey);
+      const now = nowIso();
+      if (!existing) {
+        const session: ProjectSessionRecord = {
+          id: createId("session"),
+          projectKey: canonical.projectKey,
+          projectRoot: canonical.projectRoot,
+          generation: 1,
+          runtimeHostId: task.runtimeHostId,
+          activeTaskId: task.id,
+          codexThreadId: task.codexThreadId,
+          status: "ACTIVE",
+          claimToken: null,
+          claimExpiresAt: null,
+          createdAt: now,
+          updatedAt: now,
+        };
+        this.db
+          .prepare(
+            `
+            insert into project_session (
+              id, project_key, project_root, generation, runtime_host_id,
+              active_task_id, codex_thread_id, status, claim_token,
+              claim_expires_at, created_at, updated_at
+            ) values (
+              @id, @projectKey, @projectRoot, @generation, @runtimeHostId,
+              @activeTaskId, @codexThreadId, @status, @claimToken,
+              @claimExpiresAt, @createdAt, @updatedAt
+            )
+            `,
+          )
+          .run(session);
+        return session;
+      }
+      const generation =
+        existing.activeTaskId === task.id ? existing.generation : existing.generation + 1;
+      this.db
+        .prepare(
+          `
+          update project_session
+          set project_root = ?, generation = ?, runtime_host_id = ?,
+              active_task_id = ?, codex_thread_id = ?, status = 'ACTIVE',
+              claim_token = null, claim_expires_at = null, updated_at = ?
+          where id = ?
+          `,
+        )
+        .run(
+          canonical.projectRoot,
+          generation,
+          task.runtimeHostId,
+          task.id,
+          task.codexThreadId,
+          now,
+          existing.id,
+        );
+      return {
+        ...existing,
+        projectRoot: canonical.projectRoot,
+        generation,
+        runtimeHostId: task.runtimeHostId,
+        activeTaskId: task.id,
+        codexThreadId: task.codexThreadId,
+        status: "ACTIVE",
+        claimToken: null,
+        claimExpiresAt: null,
+        updatedAt: now,
+      };
+    });
+    return tx();
+  }
+
+  markProjectSessionsRecovering(runtimeHostId: string): void {
+    this.db
+      .prepare(
+        `
+        update project_session
+        set status = 'RECOVERING', generation = generation + 1, updated_at = ?
+        where runtime_host_id = ? and status = 'ACTIVE'
+        `,
+      )
+      .run(nowIso(), runtimeHostId);
+  }
+
+  getTuiInstance(sessionId: string): TuiInstanceRecord | null {
+    const row = this.db
+      .prepare("select * from tui_instance where session_id = ?")
+      .get(sessionId) as TuiInstanceRow | undefined;
+    return row ? tuiInstanceFromRow(row) : null;
+  }
+
+  claimTuiLaunch(input: {
+    sessionId: string;
+    generation: number;
+    runtimeEndpoint: string;
+    codexThreadId: string;
+    claimToken: string;
+    claimExpiresAt: string;
+  }): { outcome: "launch" | "wait"; instance: TuiInstanceRecord } {
+    const tx = this.db.transaction((): {
+      outcome: "launch" | "wait";
+      instance: TuiInstanceRecord;
+    } => {
+      const existing = this.getTuiInstance(input.sessionId);
+      const now = nowIso();
+      if (
+        existing?.status === "LAUNCHING" &&
+        Date.parse(existing.claimExpiresAt ?? "") > Date.now() &&
+        existing.claimToken !== input.claimToken
+      ) {
+        return { outcome: "wait", instance: existing };
+      }
+      const instance: TuiInstanceRecord = {
+        sessionId: input.sessionId,
+        generation: input.generation,
+        runtimeEndpoint: input.runtimeEndpoint,
+        codexThreadId: input.codexThreadId,
+        pid: null,
+        processStartedAt: null,
+        status: "LAUNCHING",
+        claimToken: input.claimToken,
+        claimExpiresAt: input.claimExpiresAt,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+      };
+      this.db
+        .prepare(
+          `
+          insert into tui_instance (
+            session_id, generation, runtime_endpoint, codex_thread_id, pid,
+            process_started_at, status, claim_token, claim_expires_at,
+            created_at, updated_at
+          ) values (
+            @sessionId, @generation, @runtimeEndpoint, @codexThreadId, @pid,
+            @processStartedAt, @status, @claimToken, @claimExpiresAt,
+            @createdAt, @updatedAt
+          )
+          on conflict(session_id) do update set
+            generation = excluded.generation,
+            runtime_endpoint = excluded.runtime_endpoint,
+            codex_thread_id = excluded.codex_thread_id,
+            pid = excluded.pid,
+            process_started_at = excluded.process_started_at,
+            status = excluded.status,
+            claim_token = excluded.claim_token,
+            claim_expires_at = excluded.claim_expires_at,
+            updated_at = excluded.updated_at
+          `,
+        )
+        .run(instance);
+      return { outcome: "launch", instance };
+    });
+    return tx();
+  }
+
+  completeTuiLaunch(input: {
+    sessionId: string;
+    claimToken: string;
+    pid: number | null;
+    processStartedAt: string;
+  }): TuiInstanceRecord {
+    const result = this.db
+      .prepare(
+        `
+        update tui_instance
+        set pid = ?, process_started_at = ?, status = 'RUNNING',
+            claim_token = null, claim_expires_at = null, updated_at = ?
+        where session_id = ? and status = 'LAUNCHING' and claim_token = ?
+        `,
+      )
+      .run(
+        input.pid,
+        input.processStartedAt,
+        nowIso(),
+        input.sessionId,
+        input.claimToken,
+      );
+    if (result.changes !== 1) {
+      throw new Error(`TUI launch claim was lost before completion: ${input.sessionId}`);
+    }
+    const instance = this.getTuiInstance(input.sessionId);
+    if (!instance) {
+      throw new Error(`TUI instance disappeared after launch: ${input.sessionId}`);
+    }
+    return instance;
+  }
+
+  failTuiLaunch(sessionId: string, claimToken: string): void {
+    this.db
+      .prepare(
+        `
+        update tui_instance
+        set status = 'FAILED', claim_token = null, claim_expires_at = null, updated_at = ?
+        where session_id = ? and status = 'LAUNCHING' and claim_token = ?
+        `,
+      )
+      .run(nowIso(), sessionId, claimToken);
+  }
+
+  markTuiInstancesStale(runtimeEndpoint: string): TuiInstanceRecord[] {
+    const tx = this.db.transaction((): TuiInstanceRecord[] => {
+      const rows = this.db
+        .prepare("select * from tui_instance where runtime_endpoint = ? and status = 'RUNNING'")
+        .all(runtimeEndpoint) as TuiInstanceRow[];
+      if (rows.length > 0) {
+        this.db
+          .prepare(
+            `
+            update tui_instance
+            set status = 'STALE', updated_at = ?
+            where runtime_endpoint = ? and status = 'RUNNING'
+            `,
+          )
+          .run(nowIso(), runtimeEndpoint);
+      }
+      return rows.map(tuiInstanceFromRow);
+    });
+    return tx();
   }
 
   markRuntimeStatus(id: string, status: RuntimeStatus): void {
@@ -394,25 +936,239 @@ export class SqliteStore {
         `
         insert into turn (
           id, task_id, codex_thread_id, codex_turn_id, status,
-          instruction, created_at, updated_at
+          instruction, attention_revision, attention_ack_revision, attention_kind,
+          attention_payload_json, result_json, created_at, updated_at
         ) values (
           @id, @taskId, @codexThreadId, @codexTurnId, @status,
-          @instruction, @createdAt, @updatedAt
+          @instruction, @attentionRevision, @attentionAckRevision, @attentionKind,
+          @attentionPayloadJson, @resultJson, @createdAt, @updatedAt
         )
         on conflict(id) do update set
           codex_turn_id = excluded.codex_turn_id,
           status = excluded.status,
           instruction = excluded.instruction,
+          attention_revision = excluded.attention_revision,
+          attention_ack_revision = max(attention_ack_revision, excluded.attention_ack_revision),
+          attention_kind = excluded.attention_kind,
+          attention_payload_json = excluded.attention_payload_json,
+          result_json = excluded.result_json,
           updated_at = excluded.updated_at
         `,
       )
-      .run(turn);
+      .run({
+        ...turn,
+        attentionRevision: turn.attentionRevision ?? 0,
+        attentionAckRevision: turn.attentionAckRevision ?? 0,
+        attentionKind: turn.attentionKind ?? null,
+        attentionPayloadJson: toJson(turn.attentionPayload),
+        resultJson: toJson(turn.result),
+      });
   }
 
-  updateTurnByCodexTurnId(codexTurnId: string, status: string): void {
+  updateTurnResult(codexTurnId: string, result: unknown): void {
     this.db
-      .prepare("update turn set status = ?, updated_at = ? where codex_turn_id = ?")
-      .run(status, nowIso(), codexTurnId);
+      .prepare("update turn set result_json = ?, updated_at = ? where codex_turn_id = ?")
+      .run(toJson(result), nowIso(), codexTurnId);
+  }
+
+  getLatestPendingAttention(taskId: string): TurnRecord | null {
+    const row = this.db
+      .prepare(
+        `
+        select * from turn
+        where id = (
+          select id from turn
+          where task_id = ?
+          order by created_at desc, rowid desc
+          limit 1
+        )
+          and codex_turn_id is not null
+          and attention_kind is not null
+          and attention_revision > attention_ack_revision
+        `,
+      )
+      .get(taskId) as TurnRow | undefined;
+    return row ? turnFromRow(row) : null;
+  }
+
+  acknowledgeTurnAttention(codexTurnId: string, revision: number): TurnRecord | null {
+    this.db
+      .prepare(
+        `
+        update turn
+        set attention_ack_revision = min(
+              attention_revision,
+              max(attention_ack_revision, ?)
+            ),
+            updated_at = ?
+        where codex_turn_id = ?
+        `,
+      )
+      .run(Math.max(0, revision), nowIso(), codexTurnId);
+    return this.getTurnByCodexTurnId(codexTurnId);
+  }
+
+  recordTurnAttention(input: {
+    taskId: string;
+    codexTurnId: string;
+    turnStatus: string;
+    taskStatus: string;
+    attentionKind: string;
+    attentionPayload: unknown;
+    event?: Omit<EventRecord, "seq" | "createdAt" | "claudeDelivered">;
+  }): { turn: TurnRecord | null; event: EventRecord | null } {
+    const tx = this.db.transaction(() => {
+      const now = nowIso();
+      const updated = this.db
+        .prepare(
+          `
+          update turn
+          set status = ?, attention_revision = attention_revision + 1,
+              attention_kind = ?, attention_payload_json = ?, updated_at = ?
+          where task_id = ? and codex_turn_id = ?
+            and status in ('running', 'awaiting_approval')
+          `,
+        )
+        .run(
+          input.turnStatus,
+          input.attentionKind,
+          toJson(input.attentionPayload),
+          now,
+          input.taskId,
+          input.codexTurnId,
+        );
+      if (updated.changes === 0) {
+        return {
+          turn: this.getTurnByCodexTurnId(input.codexTurnId),
+          event: null,
+        };
+      }
+      this.db
+        .prepare("update task set status = ?, updated_at = ? where id = ?")
+        .run(input.taskStatus, now, input.taskId);
+      return {
+        turn: this.getTurnByCodexTurnId(input.codexTurnId),
+        event: input.event ? this.appendEvent(input.event) : null,
+      };
+    });
+    return tx();
+  }
+
+  recordApprovalAttention(
+    approval: ApprovalRecord,
+    eventInput: Omit<EventRecord, "seq" | "createdAt" | "claudeDelivered">,
+  ): { approval: ApprovalRecord; event: EventRecord | null; turn: TurnRecord | null; created: boolean } {
+    const tx = this.db.transaction(() => {
+      let activeTurn = approval.codexTurnId
+        ? this.getTurnByCodexTurnId(approval.codexTurnId)
+        : this.getLatestTurn(approval.taskId);
+      if (!activeTurn && approval.codexTurnId) {
+        const now = nowIso();
+        this.saveTurn({
+          id: `turn_${approval.codexTurnId}`,
+          taskId: approval.taskId,
+          codexThreadId: approval.codexThreadId,
+          codexTurnId: approval.codexTurnId,
+          status: "running",
+          instruction: null,
+          attentionRevision: 0,
+          attentionAckRevision: 0,
+          attentionKind: null,
+          attentionPayload: null,
+          result: null,
+          createdAt: now,
+          updatedAt: now,
+        });
+        activeTurn = this.getTurnByCodexTurnId(approval.codexTurnId);
+      }
+      if (!activeTurn?.codexTurnId || !["running", "awaiting_approval"].includes(activeTurn.status)) {
+        throw new Error(`Approval received without an active Codex turn: ${approval.taskId}`);
+      }
+      const effectiveApproval = {
+        ...approval,
+        codexTurnId: activeTurn.codexTurnId,
+      };
+      const existing = this.getApprovalByRequest(effectiveApproval);
+      if (existing) {
+        return {
+          approval: existing,
+          event: null,
+          turn: existing.codexTurnId
+            ? this.getTurnByCodexTurnId(existing.codexTurnId)
+            : this.getLatestTurn(existing.taskId),
+          created: false,
+        };
+      }
+
+      this.saveApproval(effectiveApproval);
+      const now = nowIso();
+      this.db
+        .prepare(
+          `
+          update turn
+          set status = 'awaiting_approval',
+              attention_revision = attention_revision + 1,
+              attention_kind = 'approval', attention_payload_json = ?, updated_at = ?
+          where task_id = ? and codex_turn_id = ? and status = 'running'
+          `,
+        )
+        .run(toJson(eventInput.payload), now, approval.taskId, activeTurn.codexTurnId);
+      this.db
+        .prepare("update task set status = 'awaiting_approval', updated_at = ? where id = ?")
+        .run(now, approval.taskId);
+      const turn = this.getTurnByCodexTurnId(activeTurn.codexTurnId);
+      const event = this.appendEvent(eventInput);
+      return { approval: effectiveApproval, event, turn, created: true };
+    });
+    return tx();
+  }
+
+  resolveApprovalAndResumeTurn(
+    approvalId: string,
+    decision: string,
+    decidedBy: string,
+    reason: string,
+    eventInput: Omit<EventRecord, "seq" | "createdAt" | "claudeDelivered">,
+  ): { event: EventRecord; turn: TurnRecord | null } {
+    const tx = this.db.transaction(() => {
+      const approval = this.getApproval(approvalId);
+      if (!approval) {
+        throw new Error(`approvalId not found: ${approvalId}`);
+      }
+      const now = nowIso();
+      const currentTurn = approval.codexTurnId
+        ? this.getTurnByCodexTurnId(approval.codexTurnId)
+        : null;
+      this.db
+        .prepare(
+          `
+          update approval
+          set decision = ?, decided_by = ?, decision_reason = ?, resolved_at = ?
+          where id = ? and decision is null
+          `,
+        )
+        .run(decision, decidedBy, reason, now, approvalId);
+      if (approval.codexTurnId && currentTurn?.status === "awaiting_approval") {
+        this.db
+          .prepare(
+            `
+            update turn
+            set status = 'running', attention_kind = null,
+                attention_payload_json = null, updated_at = ?
+            where codex_turn_id = ? and status = 'awaiting_approval'
+            `,
+          )
+          .run(now, approval.codexTurnId);
+        this.db
+          .prepare("update task set status = 'running', updated_at = ? where id = ?")
+          .run(now, approval.taskId);
+      }
+      return {
+        event: this.appendEvent(eventInput),
+        turn: approval.codexTurnId ? this.getTurnByCodexTurnId(approval.codexTurnId) : null,
+      };
+    });
+    return tx();
   }
 
   getLatestTurn(taskId: string): TurnRecord | null {
@@ -547,16 +1303,25 @@ export class SqliteStore {
     return row ? approvalFromRow(row) : null;
   }
 
-  resolveApproval(approvalId: string, decision: string, decidedBy: string, reason: string): void {
-    this.db
+  private getApprovalByRequest(approval: ApprovalRecord): ApprovalRecord | null {
+    const row = this.db
       .prepare(
         `
-        update approval
-        set decision = ?, decided_by = ?, decision_reason = ?, resolved_at = ?
-        where id = ?
+        select * from approval
+        where task_id = ? and codex_request_id = ? and kind = ?
+          and ((codex_turn_id = ?) or (codex_turn_id is null and ? is null))
+        order by created_at asc
+        limit 1
         `,
       )
-      .run(decision, decidedBy, reason, nowIso(), approvalId);
+      .get(
+        approval.taskId,
+        JSON.stringify(approval.codexRequestId),
+        approval.kind,
+        approval.codexTurnId,
+        approval.codexTurnId,
+      ) as ApprovalRow | undefined;
+    return row ? approvalFromRow(row) : null;
   }
 
   saveContextUsage(usage: ContextUsageRecord): void {
@@ -641,6 +1406,95 @@ export class SqliteStore {
       .run(nowIso(), id);
   }
 
+  orphanPendingApprovalsForRuntime(
+    runtimeHostId: string,
+    reason: string,
+  ): OrphanedRuntimeApprovals {
+    const tx = this.db.transaction((): OrphanedRuntimeApprovals => {
+      const approvalRows = this.db
+        .prepare(
+          `
+          select approval.* from approval
+          inner join task on task.id = approval.task_id
+          where task.runtime_host_id = ? and approval.decision is null
+          order by approval.created_at asc
+          `,
+        )
+        .all(runtimeHostId) as ApprovalRow[];
+      if (approvalRows.length === 0) {
+        return { turns: [], approvals: [] };
+      }
+
+      const now = nowIso();
+      this.db
+        .prepare(
+          `
+          update approval
+          set decision = 'orphaned', decided_by = 'bridge', decision_reason = ?, resolved_at = ?
+          where decision is null
+            and task_id in (select id from task where runtime_host_id = ?)
+          `,
+        )
+        .run(reason, now, runtimeHostId);
+
+      const turnIds = [
+        ...new Set(
+          approvalRows
+            .map((row) => row.codex_turn_id)
+            .filter((turnId): turnId is string => Boolean(turnId)),
+        ),
+      ];
+      const turns: TurnRecord[] = [];
+      const updateTurn = this.db.prepare(
+        `
+        update turn
+        set status = 'interrupted', attention_revision = attention_revision + 1,
+            attention_kind = 'interrupted', attention_payload_json = ?, updated_at = ?
+        where codex_turn_id = ? and status = 'awaiting_approval'
+        `,
+      );
+      const updateTask = this.db.prepare(
+        "update task set status = 'interrupted', updated_at = ? where id = ?",
+      );
+      for (const turnId of turnIds) {
+        const current = this.getTurnByCodexTurnId(turnId);
+        if (!current) {
+          continue;
+        }
+        const updated = updateTurn.run(
+          toJson({
+            type: "codex_turn_interrupted",
+            reason,
+            nextAction: "task_recover",
+          }),
+          now,
+          turnId,
+        );
+        if (updated.changes > 0) {
+          updateTask.run(now, current.taskId);
+          const turn = this.getTurnByCodexTurnId(turnId);
+          if (turn) {
+            turns.push(turn);
+          }
+        }
+      }
+
+      return {
+        turns,
+        approvals: approvalRows.map((row) =>
+          approvalFromRow({
+            ...row,
+            decision: "orphaned",
+            decided_by: "bridge",
+            decision_reason: reason,
+            resolved_at: now,
+          }),
+        ),
+      };
+    });
+    return tx();
+  }
+
   markRuntimeDependentsInterrupted(runtimeHostId: string): RuntimeDependentsInterrupted {
     const tx = this.db.transaction((): RuntimeDependentsInterrupted => {
       const taskRows = this.db
@@ -651,7 +1505,7 @@ export class SqliteStore {
           `
           select turn.* from turn
           inner join task on task.id = turn.task_id
-          where task.runtime_host_id = ? and turn.status = 'running'
+          where task.runtime_host_id = ? and turn.status in ('running', 'awaiting_approval')
           order by turn.created_at asc
           `,
         )
@@ -683,7 +1537,7 @@ export class SqliteStore {
 
       const now = nowIso();
       const approvalDecisionReason =
-        "Bridge automatically denied this pending approval because its Runtime Host was unreachable and treated as DEAD.";
+        "Approval was orphaned because its Runtime Host connection was lost; it cannot be answered on a replacement connection.";
       const affectedTaskIds = new Set([
         ...turnRows.map((row) => row.task_id),
         ...commandRows.map((row) => row.task_id),
@@ -698,12 +1552,25 @@ export class SqliteStore {
       this.db
         .prepare(
           `
-          update turn set status = 'interrupted', updated_at = ?
-          where status = 'running'
+          update turn
+          set status = 'interrupted',
+              attention_revision = attention_revision + 1,
+              attention_kind = 'interrupted',
+              attention_payload_json = ?,
+              updated_at = ?
+          where status in ('running', 'awaiting_approval')
             and task_id in (select id from task where runtime_host_id = ?)
           `,
         )
-        .run(now, runtimeHostId);
+        .run(
+          toJson({
+            type: "codex_turn_interrupted",
+            reason: "Runtime Host became unreachable.",
+            nextAction: "task_recover",
+          }),
+          now,
+          runtimeHostId,
+        );
       this.db
         .prepare(
           `
@@ -717,7 +1584,7 @@ export class SqliteStore {
         .prepare(
           `
           update approval
-          set decision = 'auto_denied', decided_by = 'bridge', decision_reason = ?, resolved_at = ?
+          set decision = 'orphaned', decided_by = 'bridge', decision_reason = ?, resolved_at = ?
           where decision is null
             and task_id in (select id from task where runtime_host_id = ?)
           `,
@@ -737,7 +1604,7 @@ export class SqliteStore {
         approvals: approvalRows.map((row) =>
           approvalFromRow({
             ...row,
-            decision: "auto_denied",
+            decision: "orphaned",
             decided_by: "bridge",
             decision_reason: approvalDecisionReason,
             resolved_at: now,
@@ -810,9 +1677,211 @@ export class SqliteStore {
   }
 
   private initSchema(): void {
+    const schemaVersion = this.db.pragma("user_version", { simple: true }) as number;
+    if (schemaVersion > 2) {
+      throw new Error(`Bridge database schema ${schemaVersion} is newer than supported version 2.`);
+    }
     const schemaPath = fileURLToPath(new URL("schema.sql", import.meta.url));
     this.db.exec(fs.readFileSync(schemaPath, "utf8"));
     this.ensureColumn("approval", "payload_json", "text");
+    this.ensureColumn("turn", "attention_revision", "integer not null default 0");
+    this.ensureColumn("turn", "attention_ack_revision", "integer not null default 0");
+    this.ensureColumn("turn", "attention_kind", "text");
+    this.ensureColumn("turn", "attention_payload_json", "text");
+    this.ensureColumn("turn", "result_json", "text");
+    this.enforceLifecycleConstraints();
+    this.backfillProjectSessions();
+    this.backfillTuiInstances();
+    this.backfillPendingApprovalAttention();
+    this.db.pragma("user_version = 2");
+  }
+
+  private enforceLifecycleConstraints(): void {
+    const tx = this.db.transaction(() => {
+      const now = nowIso();
+      this.db
+        .prepare(
+          `
+          update turn
+          set status = 'interrupted', attention_revision = attention_revision + 1,
+              attention_kind = 'interrupted', attention_payload_json = ?, updated_at = ?
+          where status in ('running', 'awaiting_approval')
+            and rowid not in (
+              select max(rowid) from turn
+              where status in ('running', 'awaiting_approval')
+              group by task_id
+            )
+          `,
+        )
+        .run(
+          toJson({
+            type: "codex_turn_interrupted",
+            reason: "Duplicate active turn repaired during Bridge lifecycle migration.",
+            nextAction: "task_status",
+          }),
+          now,
+        );
+      this.db
+        .prepare(
+          `
+          update task_command_queue
+          set status = 'interrupted', finished_at = ?
+          where status = 'running'
+            and rowid not in (
+              select max(rowid) from task_command_queue
+              where status = 'running'
+              group by task_id
+            )
+          `,
+        )
+        .run(now);
+    });
+    tx();
+    this.db.exec(
+      `
+      create unique index if not exists idx_turn_one_active_per_task
+        on turn(task_id) where status in ('running', 'awaiting_approval');
+      create unique index if not exists idx_command_one_running_per_task
+        on task_command_queue(task_id) where status = 'running';
+      `,
+    );
+  }
+
+  private backfillProjectSessions(): void {
+    const taskRows = this.db.prepare("select * from task order by updated_at desc").all() as TaskRow[];
+    const seen = new Set<string>();
+    const insert = this.db.prepare(
+      `
+      insert or ignore into project_session (
+        id, project_key, project_root, generation, runtime_host_id,
+        active_task_id, codex_thread_id, status, claim_token,
+        claim_expires_at, created_at, updated_at
+      ) values (?, ?, ?, 1, ?, ?, ?, 'ACTIVE', null, null, ?, ?)
+      `,
+    );
+    const tx = this.db.transaction(() => {
+      for (const row of taskRows) {
+        const canonical = canonicalizeProjectRoot(row.project_root);
+        if (seen.has(canonical.projectKey)) {
+          continue;
+        }
+        seen.add(canonical.projectKey);
+        insert.run(
+          createId("session"),
+          canonical.projectKey,
+          canonical.projectRoot,
+          row.runtime_host_id,
+          row.id,
+          row.codex_thread_id,
+          row.created_at,
+          row.updated_at,
+        );
+      }
+    });
+    tx();
+  }
+
+  private backfillTuiInstances(): void {
+    const sessions = this.db
+      .prepare(
+        `
+        select * from project_session
+        where active_task_id is not null and codex_thread_id is not null
+        `,
+      )
+      .all() as ProjectSessionRow[];
+    const findLaunch = this.db.prepare(
+      `
+      select * from event
+      where task_id = ? and event_type = 'codex_tui_window_launched'
+      order by seq desc limit 1
+      `,
+    );
+    const insert = this.db.prepare(
+      `
+      insert or ignore into tui_instance (
+        session_id, generation, runtime_endpoint, codex_thread_id, pid,
+        process_started_at, status, claim_token, claim_expires_at,
+        created_at, updated_at
+      ) values (?, ?, ?, ?, ?, ?, 'RUNNING', null, null, ?, ?)
+      `,
+    );
+    const tx = this.db.transaction(() => {
+      for (const row of sessions) {
+        if (!row.active_task_id || !row.codex_thread_id || !row.runtime_host_id) {
+          continue;
+        }
+        const runtime = this.getRuntime(row.runtime_host_id);
+        const event = findLaunch.get(row.active_task_id) as EventRow | undefined;
+        if (!runtime || !event) {
+          continue;
+        }
+        const payload = fromJson<Record<string, unknown>>(event.payload_json, {});
+        const pid = typeof payload.pid === "number" ? payload.pid : null;
+        insert.run(
+          row.id,
+          row.generation,
+          runtime.endpoint,
+          row.codex_thread_id,
+          pid,
+          event.created_at,
+          event.created_at,
+          event.created_at,
+        );
+      }
+    });
+    tx();
+  }
+
+  private backfillPendingApprovalAttention(): void {
+    const rows = this.db
+      .prepare(
+        `
+        select approval.* from approval
+        inner join turn on turn.task_id = approval.task_id
+          and turn.codex_turn_id = approval.codex_turn_id
+        where approval.decision is null
+          and turn.status in ('running', 'awaiting_approval')
+          and turn.attention_revision = 0
+        order by approval.created_at asc
+        `,
+      )
+      .all() as ApprovalRow[];
+    const updateTurn = this.db.prepare(
+      `
+      update turn
+      set status = 'awaiting_approval', attention_revision = 1,
+          attention_kind = 'approval', attention_payload_json = ?, updated_at = ?
+      where task_id = ? and codex_turn_id = ? and attention_revision = 0
+      `,
+    );
+    const updateTask = this.db.prepare(
+      "update task set status = 'awaiting_approval', updated_at = ? where id = ?",
+    );
+    const tx = this.db.transaction(() => {
+      for (const row of rows) {
+        const approval = approvalFromRow(row);
+        const now = nowIso();
+        updateTurn.run(
+          toJson({
+            type: "approval_requested",
+            approvalId: approval.id,
+            codexRequestId: approval.codexRequestId,
+            kind: approval.kind,
+            command: approval.command,
+            cwd: approval.cwd,
+            reason: approval.reason,
+            riskSummary: approval.riskSummary,
+            nextAction: "approval_decide",
+          }),
+          now,
+          approval.taskId,
+          approval.codexTurnId,
+        );
+        updateTask.run(now, approval.taskId);
+      }
+    });
+    tx();
   }
 
   private ensureColumn(table: string, column: string, type: string): void {
@@ -834,6 +1903,39 @@ function runtimeFromRow(row: RuntimeHostRow): RuntimeHostRecord {
     status: row.status,
     startedAt: row.started_at,
     lastHeartbeatAt: row.last_heartbeat_at,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function projectSessionFromRow(row: ProjectSessionRow): ProjectSessionRecord {
+  return {
+    id: row.id,
+    projectKey: row.project_key,
+    projectRoot: row.project_root,
+    generation: row.generation,
+    runtimeHostId: row.runtime_host_id,
+    activeTaskId: row.active_task_id,
+    codexThreadId: row.codex_thread_id,
+    status: row.status,
+    claimToken: row.claim_token,
+    claimExpiresAt: row.claim_expires_at,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function tuiInstanceFromRow(row: TuiInstanceRow): TuiInstanceRecord {
+  return {
+    sessionId: row.session_id,
+    generation: row.generation,
+    runtimeEndpoint: row.runtime_endpoint,
+    codexThreadId: row.codex_thread_id,
+    pid: row.pid,
+    processStartedAt: row.process_started_at,
+    status: row.status,
+    claimToken: row.claim_token,
+    claimExpiresAt: row.claim_expires_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -864,6 +1966,11 @@ function turnFromRow(row: TurnRow): TurnRecord {
     codexTurnId: row.codex_turn_id,
     status: row.status,
     instruction: row.instruction,
+    attentionRevision: row.attention_revision ?? 0,
+    attentionAckRevision: row.attention_ack_revision ?? 0,
+    attentionKind: row.attention_kind ?? null,
+    attentionPayload: fromJson(row.attention_payload_json, null),
+    result: fromJson(row.result_json, null),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

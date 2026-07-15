@@ -18,6 +18,8 @@ import type {
 import type {
   ThreadCompactStartParams,
   ThreadCompactStartResponse,
+  ThreadReadParams,
+  ThreadReadResponse,
   ThreadResumeParams,
   ThreadResumeResponse,
   ThreadSetNameParams,
@@ -31,6 +33,12 @@ import type {
 interface PendingRequest {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
+}
+
+interface PendingServerResolution {
+  resolve: () => void;
+  reject: (error: Error) => void;
+  timeout: ReturnType<typeof setTimeout>;
 }
 
 interface CodexRequestMap {
@@ -54,6 +62,10 @@ interface CodexRequestMap {
     params: ThreadCompactStartParams;
     result: ThreadCompactStartResponse;
   };
+  "thread/read": {
+    params: ThreadReadParams;
+    result: ThreadReadResponse;
+  };
   "turn/start": {
     params: TurnStartParams;
     result: TurnStartResponse;
@@ -68,10 +80,13 @@ export interface TurnStartInput {
 
 export class CodexAppServerClient extends EventEmitter {
   private socket: WebSocket | null = null;
+  private connectPromise: Promise<void> | null = null;
   private nextId = 1;
   private initialized = false;
   private readonly pending = new Map<JsonRpcId, PendingRequest>();
+  private readonly pendingServerResolutions = new Map<string, PendingServerResolution>();
   private readonly loadedThreads = new Set<string>();
+  private readonly loadingThreads = new Map<string, Promise<void>>();
 
   constructor(
     readonly endpoint: string,
@@ -84,7 +99,16 @@ export class CodexAppServerClient extends EventEmitter {
     if (this.socket?.readyState === WebSocket.OPEN && this.initialized) {
       return;
     }
+    if (this.connectPromise) {
+      return this.connectPromise;
+    }
+    this.connectPromise = this.connectInternal().finally(() => {
+      this.connectPromise = null;
+    });
+    return this.connectPromise;
+  }
 
+  private async connectInternal(): Promise<void> {
     await new Promise<void>((resolve, reject) => {
       const socket = new WebSocket(this.endpoint);
       const fail = (error: Error) => {
@@ -100,7 +124,12 @@ export class CodexAppServerClient extends EventEmitter {
       socket.once("error", fail);
     });
 
-    await this.initialize();
+    try {
+      await this.initialize();
+    } catch (error) {
+      this.drop();
+      throw error;
+    }
   }
 
   async threadStart(input: { cwd: string; developerInstructions?: string }): Promise<string> {
@@ -136,20 +165,30 @@ export class CodexAppServerClient extends EventEmitter {
     if (this.loadedThreads.has(threadId)) {
       return;
     }
-    const params = {
-      threadId,
-      model: this.bridgeConfig.codexModel ?? undefined,
-      serviceTier: this.bridgeConfig.codexServiceTier ?? undefined,
-      cwd,
-      runtimeWorkspaceRoots: cwd ? [cwd] : undefined,
-      approvalsReviewer: "user",
-      sandbox: "workspace-write",
-      config: buildCodexConfig(this.bridgeConfig),
-      developerInstructions,
-      excludeTurns: true,
-    } satisfies ThreadResumeParams;
-    await this.request("thread/resume", params);
-    this.loadedThreads.add(threadId);
+    const existing = this.loadingThreads.get(threadId);
+    if (existing) {
+      return existing;
+    }
+    const loading = (async () => {
+      const params = {
+        threadId,
+        model: this.bridgeConfig.codexModel ?? undefined,
+        serviceTier: this.bridgeConfig.codexServiceTier ?? undefined,
+        cwd,
+        runtimeWorkspaceRoots: cwd ? [cwd] : undefined,
+        approvalsReviewer: "user",
+        sandbox: "workspace-write",
+        config: buildCodexConfig(this.bridgeConfig),
+        developerInstructions,
+        excludeTurns: true,
+      } satisfies ThreadResumeParams;
+      await this.request("thread/resume", params);
+      this.loadedThreads.add(threadId);
+    })().finally(() => {
+      this.loadingThreads.delete(threadId);
+    });
+    this.loadingThreads.set(threadId, loading);
+    return loading;
   }
 
   async turnStart(input: TurnStartInput): Promise<string> {
@@ -187,6 +226,14 @@ export class CodexAppServerClient extends EventEmitter {
     await this.request("thread/compact/start", params);
   }
 
+  async readThread(threadId: string): Promise<ThreadReadResponse["thread"]> {
+    const result = await this.request("thread/read", {
+      threadId,
+      includeTurns: true,
+    });
+    return result.thread;
+  }
+
   async decideApproval(input: {
     codexRequestId: string | number;
     approvalKind: string;
@@ -195,15 +242,18 @@ export class CodexAppServerClient extends EventEmitter {
     payload?: unknown;
   }): Promise<void> {
     const response = buildApprovalResponse(input.approvalKind, input.decision, input.payload);
+    const resolved = this.waitForServerRequestResolution(input.codexRequestId);
     if (response) {
       this.respondToServerRequest(input.codexRequestId, response);
-      return;
+    } else {
+      this.rejectServerRequest(input.codexRequestId, -32000, input.reason);
     }
-    this.rejectServerRequest(input.codexRequestId, -32000, input.reason);
+    await resolved;
   }
 
   drop(): void {
     this.loadedThreads.clear();
+    this.loadingThreads.clear();
     this.initialized = false;
     if (this.socket) {
       this.socket.close();
@@ -279,6 +329,18 @@ export class CodexAppServerClient extends EventEmitter {
       const text = raw.toString("utf8");
       const message = JSON.parse(text) as JsonRpcIncoming;
       if (isNotification(message)) {
+        if (message.method === "serverRequest/resolved") {
+          const requestId = asRecord(message.params).requestId;
+          if (typeof requestId === "string" || typeof requestId === "number") {
+            const key = JSON.stringify(requestId);
+            const pendingResolution = this.pendingServerResolutions.get(key);
+            if (pendingResolution) {
+              clearTimeout(pendingResolution.timeout);
+              this.pendingServerResolutions.delete(key);
+              pendingResolution.resolve();
+            }
+          }
+        }
         this.emit("notification", {
           method: message.method,
           params: asRecord(message.params),
@@ -315,11 +377,36 @@ export class CodexAppServerClient extends EventEmitter {
         pending.reject(new Error(`Codex App Server WebSocket closed: ${this.endpoint}`));
       }
       this.pending.clear();
+      for (const pendingResolution of this.pendingServerResolutions.values()) {
+        clearTimeout(pendingResolution.timeout);
+        pendingResolution.reject(
+          new Error(`Codex App Server WebSocket closed before approval was resolved: ${this.endpoint}`),
+        );
+      }
+      this.pendingServerResolutions.clear();
       this.emit("disconnected", { endpoint: this.endpoint });
     });
 
     socket.on("error", (error) => {
       this.emit("error", error);
+    });
+  }
+
+  private waitForServerRequestResolution(id: JsonRpcId): Promise<void> {
+    const key = JSON.stringify(id);
+    const existing = this.pendingServerResolutions.get(key);
+    if (existing) {
+      clearTimeout(existing.timeout);
+      existing.reject(new Error(`Duplicate pending approval response: ${key}`));
+      this.pendingServerResolutions.delete(key);
+    }
+    return new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingServerResolutions.delete(key);
+        reject(new Error(`Codex App Server did not confirm approval resolution: ${key}`));
+      }, 10_000);
+      timeout.unref();
+      this.pendingServerResolutions.set(key, { resolve, reject, timeout });
     });
   }
 }
@@ -390,5 +477,16 @@ export class CodexClientPool {
     const client = this.clients.get(endpoint);
     client?.drop();
     this.clients.delete(endpoint);
+  }
+
+  closeAll(): void {
+    for (const client of this.clients.values()) {
+      client.drop();
+    }
+    this.clients.clear();
+  }
+
+  get size(): number {
+    return this.clients.size;
   }
 }
