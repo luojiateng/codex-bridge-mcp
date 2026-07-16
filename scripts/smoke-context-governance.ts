@@ -56,13 +56,20 @@ const privateTaskService = taskService as unknown as {
   handleNotification: (runtime: RuntimeHostRecord, notification: CodexNotification) => Promise<void>;
 };
 
-await privateTaskService.handleNotification(runtime, tokenUsageNotification(700));
-const warningStatus = await taskService.status(task.id);
-assert.deepEqual((warningStatus.context as Record<string, unknown>)?.warning, true);
-assert.deepEqual((warningStatus.context as Record<string, unknown>)?.nearLimit, false);
+await privateTaskService.handleNotification(runtime, tokenUsageNotification(835_787, 5_965));
+const cumulativeStatus = await taskService.status(task.id);
+assert.equal((cumulativeStatus.context as Record<string, unknown>)?.contextPercent, 0);
+assert.equal((cumulativeStatus.context as Record<string, unknown>)?.warning, false);
+assert.equal((cumulativeStatus.context as Record<string, unknown>)?.nearLimit, false);
 
-await privateTaskService.handleNotification(runtime, tokenUsageNotification(860));
-await privateTaskService.handleNotification(runtime, tokenUsageNotification(900));
+await privateTaskService.handleNotification(runtime, tokenUsageNotification(900_000, 184_480));
+const warningStatus = await taskService.status(task.id);
+assert.equal((warningStatus.context as Record<string, unknown>)?.contextPercent, 70);
+assert.equal((warningStatus.context as Record<string, unknown>)?.warning, true);
+assert.equal((warningStatus.context as Record<string, unknown>)?.nearLimit, false);
+
+await privateTaskService.handleNotification(runtime, tokenUsageNotification(1_000_000, 221_440));
+await privateTaskService.handleNotification(runtime, tokenUsageNotification(1_566_735, 246_400));
 await privateTaskService.handleNotification(runtime, {
   method: "error",
   params: {
@@ -73,8 +80,9 @@ await privateTaskService.handleNotification(runtime, {
 });
 
 const usage = store.getContextUsage(task.id);
-assert.equal(usage?.totalTokens, 900);
-assert.equal(usage?.contextPercent, 90);
+assert.equal(usage?.totalTokens, 1_566_735);
+assert.equal(usage?.lastTotalTokens, 246_400);
+assert.equal(usage?.contextPercent, 95.13);
 assert.equal(usage?.nearLimitEmitted, true);
 
 const events = store.listEvents(task.id, 0, 20);
@@ -146,7 +154,7 @@ assert.deepEqual(
 store.close();
 console.log("Context governance smoke test passed.");
 
-function tokenUsageNotification(totalTokens: number): CodexNotification {
+function tokenUsageNotification(totalTokens: number, lastTotalTokens: number): CodexNotification {
   return {
     method: "thread/tokenUsage/updated",
     params: {
@@ -161,13 +169,13 @@ function tokenUsageNotification(totalTokens: number): CodexNotification {
           reasoningOutputTokens: 10,
         },
         last: {
-          totalTokens: 100,
-          inputTokens: 80,
+          totalTokens: lastTotalTokens,
+          inputTokens: lastTotalTokens - 20,
           cachedInputTokens: 0,
           outputTokens: 20,
           reasoningOutputTokens: 5,
         },
-        modelContextWindow: 1000,
+        modelContextWindow: 258_400,
       },
     },
   };

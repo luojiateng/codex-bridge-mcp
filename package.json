@@ -20,6 +20,7 @@
     "smoke:queue": "tsx scripts/smoke-queue-recovery.ts",
     "smoke:recovery": "tsx scripts/smoke-recovery.ts",
     "smoke:runtime-interruption": "tsx scripts/smoke-runtime-interruption.ts",
+    "smoke:tui-process-tree": "tsx scripts/smoke-tui-process-tree.ts",
     "smoke:project-session": "tsx scripts/smoke-project-session.ts",
     "smoke:attention": "tsx scripts/smoke-attention-delivery.ts",
     "smoke:diff": "tsx scripts/smoke-diff-service.ts",

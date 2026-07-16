@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { config, type BridgeConfig } from "../config/config.js";
 import { createId, nowIso } from "../shared/id.js";
 import { SqliteStore } from "../storage/sqlite.js";
@@ -243,7 +243,18 @@ function isProcessAlive(pid: number | null): boolean {
   }
 }
 
-function terminateOwnedProcess(pid: number): void {
+export function terminateOwnedProcess(pid: number): void {
+  if (process.platform === "win32") {
+    const result = spawnSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
+      windowsHide: true,
+      stdio: "ignore",
+    });
+    if (result.status === 0 || !isProcessAlive(pid)) {
+      return;
+    }
+    const reason = result.error?.message ?? `taskkillStatus=${String(result.status)}`;
+    throw new Error(`Failed to terminate TUI process tree: pid=${pid} reason=${reason}`);
+  }
   try {
     process.kill(pid);
   } catch {

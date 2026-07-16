@@ -205,6 +205,35 @@ restarted.store.saveTurn({
   updatedAt: new Date().toISOString(),
 });
 
+const runningBeforeTerminationFailure = restarted.store.getTuiInstance(
+  afterRestart.projectSessionId,
+);
+assert(runningBeforeTerminationFailure?.pid);
+const launchCountBeforeTerminationFailure = tuiLaunchCount;
+const terminationFailureManager = new TuiWindowManager(restarted.store, config, launchTui, {
+  isAlive: processController.isAlive,
+  terminate: () => {
+    throw new Error("simulated process-tree termination failure");
+  },
+});
+await assert.rejects(
+  terminationFailureManager.ensure({
+    runtimeId: runtime.id,
+    projectRoot: canonicalProjectRoot,
+    endpoint,
+    threadId: "thread_replacement_must_not_launch",
+    sessionId: afterRestart.projectSessionId,
+    sessionGeneration: 2,
+  }),
+  /simulated process-tree termination failure/,
+);
+assert.equal(tuiLaunchCount, launchCountBeforeTerminationFailure);
+assert.equal(
+  restarted.store.getTuiInstance(afterRestart.projectSessionId)?.pid,
+  runningBeforeTerminationFailure.pid,
+);
+assert.equal(restarted.store.getTuiInstance(afterRestart.projectSessionId)?.status, "RUNNING");
+
 const isolated = await restarted.taskService.openTask({
   projectRoot: canonicalProjectRoot,
   title: "Explicit Isolated Session",
