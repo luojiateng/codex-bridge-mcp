@@ -18,6 +18,7 @@ import {
   type TurnRecord,
   SqliteStore,
 } from "../src/storage/sqlite.js";
+import { ProjectSessionCoordinator } from "../src/task/projectSessionCoordinator.js";
 import { TaskService } from "../src/task/taskService.js";
 
 interface RpcMessage {
@@ -238,7 +239,13 @@ assert.equal(tuiLaunchCount, 1);
 const recoveredRuntime = await runtimeHostManager.ensureExistingRuntime(targetRuntime.id);
 assert.equal(recoveredRuntime.status, "RUNNING");
 assert.equal(readinessChecks, 3);
-const relaunchedTui = await tuiWindowManager.ensure(tuiInput);
+const recoveredSession = store.getProjectSessionById(targetSession.id);
+assert(recoveredSession);
+assert.equal(recoveredSession.generation, targetSession.generation + 1);
+const relaunchedTui = await tuiWindowManager.ensure({
+  ...tuiInput,
+  sessionGeneration: recoveredSession.generation,
+});
 assert.equal(relaunchedTui.launched, true);
 assert.equal(tuiLaunchCount, 2);
 assert.equal(store.getLatestTurn(targetTask.id)?.status, "interrupted");
@@ -278,6 +285,8 @@ const taskService = new TaskService(
   logger,
   {} as never,
   bridgeConfig,
+  new ProjectSessionCoordinator(store),
+  tuiWindowManager,
 );
 await taskService.waitForStartupRecovery();
 const summarizedEvents = await taskService.events({
@@ -306,6 +315,17 @@ assert.deepEqual(approvalSummary.details, {
 });
 const interruptedAttention = taskService.getPendingAttention(targetTask.id);
 assert.equal(interruptedAttention?.attention.kind, "interrupted");
+const sessionBeforeSend = store.getProjectSessionByKey(
+  canonicalizeProjectRoot(targetTask.projectRoot).projectKey,
+);
+assert(sessionBeforeSend);
+const tuiBeforeSend = store.getTuiInstance(sessionBeforeSend.id);
+assert.equal(tuiBeforeSend?.status, "RUNNING");
+assert.equal(tuiBeforeSend?.pid, relaunchedTui.pid);
+assert(relaunchedTui.pid !== null && aliveTuiPids.has(relaunchedTui.pid));
+assert.equal(tuiBeforeSend?.generation, sessionBeforeSend.generation);
+assert.equal(tuiBeforeSend?.runtimeEndpoint, recoveredRuntime.endpoint);
+assert.equal(tuiBeforeSend?.codexThreadId, targetTask.codexThreadId);
 const started = await taskService.sendTask({
   taskId: targetTask.id,
   instruction: "Continue after automatic recovery.",
@@ -319,6 +339,7 @@ assert.equal(store.getQueueSnapshot(otherTask.id).running, 1);
 assert.equal(messages.some((message) => message.method === "thread/resume"), true);
 assert.equal(messages.some((message) => message.method === "turn/start"), true);
 
+taskService.stop();
 clientPool.drop(endpoint);
 store.close();
 for (const socket of wss.clients) {

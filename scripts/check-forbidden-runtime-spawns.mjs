@@ -14,6 +14,7 @@ const forbiddenResumeSpawns = [
 ];
 const forbiddenTaskSendSpawns = [
   ...forbiddenResumeSpawns,
+  /launchTuiForTask\s*\(/i,
   /spawn\s*\(/i,
   /execFile\s*\(/i,
   /cmd\.exe/i,
@@ -32,22 +33,28 @@ for (const file of walk(src)) {
 
 const taskServicePath = path.join(src, "task", "taskService.ts");
 const taskServiceText = fs.readFileSync(taskServicePath, "utf8");
+const taskSendStart = taskServiceText.indexOf("  async sendTask(");
+const taskSendEnd = taskServiceText.indexOf("\n  async waitForAttention(", taskSendStart);
+if (taskSendStart < 0 || taskSendEnd < 0) {
+  findings.push("src/task/taskService.ts task_send implementation could not be isolated");
+}
+const taskSendText = taskServiceText.slice(taskSendStart, taskSendEnd);
 for (const pattern of forbiddenTaskSendSpawns) {
-  if (pattern.test(taskServiceText)) {
-    findings.push(`${path.relative(root, taskServicePath)} matches ${pattern}`);
+  if (pattern.test(taskSendText)) {
+    findings.push(`${path.relative(root, taskServicePath)} task_send matches ${pattern}`);
   }
 }
 
 const tuiManagerPath = path.join(src, "runtime", "tuiWindowManager.ts");
 const tuiManagerText = fs.readFileSync(tuiManagerPath, "utf8");
-if (/Start-Process/i.test(tuiManagerText)) {
-  findings.push("src/runtime/tuiWindowManager.ts must launch exactly one TUI process directly");
+if (!/Start-Process[\s\S]*-WindowStyle Normal[\s\S]*-PassThru/i.test(tuiManagerText)) {
+  findings.push("src/runtime/tuiWindowManager.ts must create a visible PowerShell terminal and return its pid");
 }
 
 const scriptBuilderPath = path.join(src, "runtime", "powershellScriptBuilder.ts");
 const scriptBuilderText = fs.readFileSync(scriptBuilderPath, "utf8");
-if (/maxAttempts|retrying in \$retryDelaySeconds/i.test(scriptBuilderText)) {
-  findings.push("src/runtime/powershellScriptBuilder.ts must not retry Codex TUI process launches");
+if (!/while \(\$true\)[\s\S]*retrying in \$retryDelaySeconds/i.test(scriptBuilderText)) {
+  findings.push("src/runtime/powershellScriptBuilder.ts must keep the visible session alive until its first rollout is attachable");
 }
 
 if (findings.length > 0) {
