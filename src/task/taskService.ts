@@ -214,6 +214,7 @@ export class TaskService {
     this.attentionWaiters.clear();
     this.threadContexts.clear();
     this.turnContexts.clear();
+    this.tuiWindowManager.stop();
   }
 
   waitForStartupRecovery(): Promise<void> {
@@ -272,7 +273,7 @@ export class TaskService {
       const session = this.projectSessions.complete(acquisition, task);
       await this.writeTaskContract(task);
       this.registerTaskContext(task);
-      const codexTui = await this.launchTuiForTask(task, runtime, session);
+      const codexTui = await this.launchTuiForTask(task, runtime, session, true);
       const event = this.store.appendEvent({
         taskId: task.id,
         runtimeHostId: runtime.id,
@@ -342,7 +343,7 @@ export class TaskService {
           task.projectRoot,
           buildCodexDeveloperInstructions(),
         );
-        await this.launchTuiForTask(task, runtime, activeSession, true);
+        this.assertTuiRunning(task, runtime, activeSession);
 
         const codexTurnId = await client.turnStart({
           threadId: task.codexThreadId,
@@ -780,7 +781,7 @@ export class TaskService {
       runtimeHostId: runtime.id,
       status: "ACTIVE" as const,
     };
-    const codexTui = await this.launchTuiForTask(task, runtime, refreshedSession);
+    const codexTui = await this.launchTuiForTask(task, runtime, refreshedSession, true);
     const event = this.store.appendEvent({
       taskId: task.id,
       runtimeHostId: runtime.id,
@@ -988,7 +989,7 @@ export class TaskService {
       });
       await this.logger.append("tasks", task.id, event);
       if (required) {
-        throw new Error(`Codex TUI is required before task_send: ${reason}`);
+        throw new Error(`Codex TUI is required for the project session: ${reason}`);
       }
       return {
         launched: false,
@@ -996,6 +997,26 @@ export class TaskService {
         pid: null,
         reason,
       };
+    }
+  }
+
+  private assertTuiRunning(
+    task: TaskRecord,
+    runtime: RuntimeHostRecord,
+    session: ProjectSessionRecord,
+  ): void {
+    const result = this.tuiWindowManager.getRunning({
+      sessionId: session.id,
+      sessionGeneration: session.generation,
+      runtimeId: runtime.id,
+      projectRoot: task.projectRoot,
+      endpoint: runtime.endpoint,
+      threadId: task.codexThreadId,
+    });
+    if (result.mode !== "off" && result.pid === null) {
+      throw new Error(
+        "Codex TUI is not running for this project session; call task_open with mode=reuse to restore the visible session before task_send.",
+      );
     }
   }
 

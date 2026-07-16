@@ -53,7 +53,7 @@ export interface ProjectSessionClaim {
   session: ProjectSessionRecord;
 }
 
-export type TuiInstanceStatus = "LAUNCHING" | "RUNNING" | "STALE" | "FAILED";
+export type TuiInstanceStatus = "LAUNCHING" | "RUNNING" | "EXITED" | "STALE" | "FAILED";
 
 export interface TuiInstanceRecord {
   sessionId: string;
@@ -812,6 +812,18 @@ export class SqliteStore {
         `,
       )
       .run(nowIso(), sessionId, claimToken);
+  }
+
+  markTuiExited(sessionId: string, pid: number | null): void {
+    this.db
+      .prepare(
+        `
+        update tui_instance
+        set status = 'EXITED', claim_token = null, claim_expires_at = null, updated_at = ?
+        where session_id = ? and pid is ? and status = 'RUNNING'
+        `,
+      )
+      .run(nowIso(), sessionId, pid);
   }
 
   markTuiInstancesStale(runtimeEndpoint: string): TuiInstanceRecord[] {

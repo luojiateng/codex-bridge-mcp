@@ -50,7 +50,7 @@ Codex   在真实仓库中修改代码、执行命令、完成验证
 一次任务通常只有下面几步：
 
 1. Claude 用 `task_open` 连接项目会话；Bridge 默认复用该项目已经绑定的 Task、Codex 线程和 TUI，仅在没有会话时创建。
-2. Claude 用 `task_send` 发送补充要求；Bridge 会先确认同一线程的可见 TUI 仍在运行，再启动 Codex turn，并保持等待直到审批、完成、失败或中断。客户端支持 MCP progress 时，等待期间 Bridge 会发送轻量进度心跳；即使 MCP 调用被取消，最终注意力事件也会先持久化，重连后由 `task_open`、`task_send` 或 `task_status` 重放。只有显式配置 `CODEX_BRIDGE_CODEX_TUI_MODE=off` 才允许无窗口执行。
+2. Claude 用 `task_send` 发送补充要求；Bridge 会先确认同一线程的可见 TUI 仍在运行，再启动 Codex turn，并保持等待直到审批、完成、失败或中断。如果窗口已经退出，`task_send` 会拒绝转入无窗口后台执行，并要求先用 `task_open` 的 `mode: "reuse"` 恢复该项目会话。客户端支持 MCP progress 时，等待期间 Bridge 会发送轻量进度心跳；即使 MCP 调用被取消，最终注意力事件也会先持久化，重连后由 `task_open`、`task_send` 或 `task_status` 重放。只有显式配置 `CODEX_BRIDGE_CODEX_TUI_MODE=off` 才允许无窗口执行。
 3. Codex 需要授权时，`task_send` 会直接返回审批注意力事件；Claude 通过 `approval_decide` 作出决定，并继续等待同一 turn 的下一个注意力事件。
 4. Codex 完成一轮后，Claude 用 `task_diff` 审查真实改动；不满足验收条件就继续发送下一轮要求。`task_status` 和 `task_events` 只用于诊断与审计，不承担正常通知职责。
 5. 长任务接近上下文限制时，Claude 可以调用 `task_compact`，在原线程中压缩上下文。

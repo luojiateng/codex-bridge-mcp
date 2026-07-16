@@ -143,6 +143,17 @@ assert.equal(first.projectSessionId, concurrent.projectSessionId);
 assert.deepEqual([first.status, concurrent.status].sort(), ["opened", "reused"]);
 assert.equal(threadStartCount, 1);
 assert.equal(tuiLaunchCount, 1);
+const generatedTuiScripts = (await fs.readdir(config.runtimeScriptsDir)).filter((name) =>
+  name.endsWith(".tui.ps1"),
+);
+assert.equal(generatedTuiScripts.length, 1);
+const generatedTuiScript = await fs.readFile(
+  path.join(config.runtimeScriptsDir, generatedTuiScripts[0]),
+  "utf8",
+);
+assert.match(generatedTuiScript, /while \(\$true\)/);
+assert.match(generatedTuiScript, /Add-Content -LiteralPath \$TuiLogPath/);
+assert.match(generatedTuiScript, /Attempt \$\(\$attempt\):/);
 
 const restarted = createServices();
 await restarted.taskService.waitForStartupRecovery();
@@ -159,6 +170,27 @@ assert.equal(threadStartCount, 1);
 assert.equal(tuiLaunchCount, 1);
 
 alivePids.delete(afterRestart.codexTui.pid ?? -1);
+await delay(1_100);
+assert.equal(restarted.store.getTuiInstance(afterRestart.projectSessionId)?.status, "EXITED");
+await assert.rejects(
+  restarted.taskService.sendTask({
+    taskId: afterRestart.taskId,
+    instruction: "Do not launch a replacement TUI from task_send.",
+  }),
+  /Codex TUI is not running.*task_open with mode=reuse/,
+);
+assert.equal(tuiLaunchCount, 1);
+assert.equal(turnStartCount, 0);
+
+const restored = await restarted.taskService.openTask({
+  projectRoot: canonicalProjectRoot,
+  title: "Restore visible project session",
+  requirements: "reuse the existing task and restore its TUI",
+  acceptanceCriteria: [],
+});
+assert.equal(tuiLaunchCount, 2);
+assert(restored.codexTui.pid !== null && alivePids.has(restored.codexTui.pid));
+
 const followUp = await restarted.taskService.sendTask({
   taskId: afterRestart.taskId,
   instruction: "Continue visibly on the same thread.",
@@ -190,21 +222,29 @@ assert.equal(alivePids.size, 1);
 alivePids.delete(isolated.codexTui.pid ?? -1);
 failNextTuiLaunch = true;
 await assert.rejects(
-  restarted.taskService.sendTask({
-    taskId: isolated.taskId,
-    instruction: "This turn must not start without a visible TUI.",
+  restarted.taskService.openTask({
+    projectRoot: canonicalProjectRoot,
+    title: "Failed visible session restore",
+    requirements: "surface the launch failure",
+    acceptanceCriteria: [],
   }),
-  /Codex TUI is required before task_send: simulated TUI launch failure/,
+  /Codex TUI is required for the project session: simulated TUI launch failure/,
 );
+assert.equal(tuiLaunchCount, 4);
 assert.equal(turnStartCount, 1);
 
 for (const services of [primary, secondary, restarted]) {
+  services.taskService.stop();
   services.clientPool.drop(endpoint);
   services.store.close();
 }
 await new Promise<void>((resolve) => wss.close(() => resolve()));
 await new Promise<void>((resolve) => httpServer.close(() => resolve()));
 console.log("Project session smoke test passed.");
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
 
 function createServices(): {
   store: SqliteStore;
