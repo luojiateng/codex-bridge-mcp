@@ -169,6 +169,7 @@ interface ApprovalSummary {
 
 const CONTEXT_STATUS_WARNING_PERCENT = 70;
 const CONTEXT_NEAR_LIMIT_PERCENT = 85;
+const CONTEXT_BASELINE_TOKENS = 12_000;
 
 export class TaskService {
   private readonly queue = new TaskQueue();
@@ -560,6 +561,7 @@ export class TaskService {
       context: contextUsage
         ? {
             totalTokens: contextUsage.totalTokens,
+            lastTotalTokens: contextUsage.lastTotalTokens,
             modelContextWindow: contextUsage.modelContextWindow,
             contextPercent: contextUsage.contextPercent,
             limitSource: contextUsage.limitSource,
@@ -1220,8 +1222,9 @@ export class TaskService {
     const previous = this.store.getContextUsage(task.id);
     const limit = snapshot.modelContextWindow ?? task.tokenBudget;
     const codexTurnId = extractTurnId(params);
-    const contextPercent =
-      limit && limit > 0 ? Number(((snapshot.totalTokens / limit) * 100).toFixed(2)) : null;
+    const contextPercent = snapshot.modelContextWindow
+      ? contextWindowPercent(snapshot.lastTotalTokens, snapshot.modelContextWindow)
+      : cumulativeBudgetPercent(snapshot.totalTokens, task.tokenBudget);
     const limitSource = snapshot.modelContextWindow
       ? "model_context_window"
       : task.tokenBudget
@@ -1259,6 +1262,7 @@ export class TaskService {
         payload: {
           type: "context_near_limit",
           totalTokens: snapshot.totalTokens,
+          lastTotalTokens: snapshot.lastTotalTokens,
           limit,
           contextPercent,
           limitSource,
@@ -1650,7 +1654,13 @@ function summarizeDetails(
     ]);
   }
   if (eventType === "context_near_limit") {
-    return pick(payload, ["totalTokens", "limit", "contextPercent", "limitSource"]);
+    return pick(payload, [
+      "totalTokens",
+      "lastTotalTokens",
+      "limit",
+      "contextPercent",
+      "limitSource",
+    ]);
   }
   if (eventType === "codex_thread_token_usage_updated") {
     const tokenUsage = toRecord(payload.tokenUsage);
@@ -1689,6 +1699,25 @@ function pick(source: Record<string, unknown>, keys: string[]): Record<string, u
     }
   }
   return picked;
+}
+
+function contextWindowPercent(
+  lastTotalTokens: number | null,
+  modelContextWindow: number,
+): number | null {
+  if (lastTotalTokens === null || modelContextWindow <= CONTEXT_BASELINE_TOKENS) {
+    return null;
+  }
+  const usableWindow = modelContextWindow - CONTEXT_BASELINE_TOKENS;
+  const tokensInContext = Math.max(lastTotalTokens - CONTEXT_BASELINE_TOKENS, 0);
+  const percent = (tokensInContext / usableWindow) * 100;
+  return Number(Math.min(Math.max(percent, 0), 100).toFixed(2));
+}
+
+function cumulativeBudgetPercent(totalTokens: number, tokenBudget: number | null): number | null {
+  return tokenBudget && tokenBudget > 0
+    ? Number(((totalTokens / tokenBudget) * 100).toFixed(2))
+    : null;
 }
 
 function toRecord(value: unknown): Record<string, unknown> {

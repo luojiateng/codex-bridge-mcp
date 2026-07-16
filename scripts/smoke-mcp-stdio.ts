@@ -27,6 +27,7 @@ interface AttentionToolPayload {
 
 interface ReplayToolPayload {
   replayed: boolean;
+  replayReason: string;
   nextAction: string;
   requiredAckRevision?: number;
 }
@@ -151,6 +152,7 @@ try {
     }),
   );
   assert.equal(replay.replayed, true);
+  assert.match(replay.replayReason, /No new turn was started.*follow nextAction/);
   assert.equal(replay.nextAction, "task_diff");
   assert.equal(seedStore.getLatestPendingAttention(task.id)?.attentionRevision, 1);
   seedStore.acknowledgeTurnAttention(turn.codexTurnId, 1);
@@ -171,6 +173,7 @@ try {
     }),
   );
   assert.equal(failedReplay.replayed, true);
+  assert.match(failedReplay.replayReason, /No new turn was started.*follow nextAction/);
   assert.equal(failedReplay.nextAction, "task_send");
   assert.equal(failedReplay.requiredAckRevision, 2);
   seedStore.acknowledgeTurnAttention(turn.codexTurnId, 2);

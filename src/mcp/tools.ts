@@ -71,6 +71,8 @@ export function registerTools(
         return jsonResult({
           ...pending,
           replayed: true,
+          replayReason:
+            "No new turn was started because this persisted attention has not been acknowledged; follow nextAction before calling task_send again.",
           nextAction,
           requiredAckRevision: nextAction === "task_send" ? pending.attention.revision : undefined,
         });
