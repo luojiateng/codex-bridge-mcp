@@ -26,6 +26,10 @@ They must not reopen cmd or PowerShell through codex resume.
 - One Runtime Host has one long-lived `codex app-server` process.
 - One large task has one `codexThreadId`.
 - One `taskId` must never bind to multiple `codexThreadId` values.
+- One stable task-orchestrator conversation identity must bind to exactly one `taskId` and one `codexThreadId`.
+- The orchestrator identity is an explicit application-level `kind + sessionId`; the temporary MCP transport session id is not task identity.
+- A different orchestrator identity must not reuse a bound active Task. Legacy clients without stable identity must use `expectedTaskId` for bound Tasks; identical durable task contracts are accepted only for historical unbound Tasks. Project path alone is never sufficient identity.
+- Durable title, requirements and acceptance criteria must be injected through thread developer instructions on `thread/start` and `thread/resume`; ordinary `task_send` turns carry only the current instruction and check policy.
 - `task_open` may call `thread/start` only when no active Project Session exists or `mode=new` is explicit.
 - `task_send` may call only `turn/start` in the normal path.
 - `thread/resume` is allowed only for Runtime recovery or when the known thread is not loaded after reconnect.
@@ -89,6 +93,7 @@ Deliverables:
 - `task_await` for cancellation/reconnect recovery without model-level polling.
 - Durable attention ACK revision and replay of the latest unacknowledged turn attention.
 - Task table.
+- Orchestrator Session Binding table with unique orchestrator identity, Task and Codex Thread constraints.
 - Project Session table with cross-process creation claims.
 - Canonical Windows project-root identity.
 - Turn table.
@@ -100,8 +105,11 @@ Deliverables:
 Acceptance:
 
 - One `taskId` has exactly one `codexThreadId`.
+- One stable orchestrator identity has exactly one `taskId` and `codexThreadId`, including after MCP/Core reconnect.
 - Multiple `task_send` calls keep the same `codexThreadId`.
-- Repeated or concurrent `task_open(mode=reuse)` calls return the same `taskId` and `codexThreadId` and issue only one `thread/start`.
+- Repeated or concurrent `task_open(mode=reuse)` calls with the same orchestrator identity return the same `taskId` and `codexThreadId` and issue only one `thread/start`.
+- A different orchestrator identity is rejected before Runtime/TUI work when the active Task is already bound; independent work uses a new identity plus `mode=new`.
+- The exact durable task contract is present in App Server thread developer instructions, while every `turn/start` contains only the current incremental instruction and check policy.
 - Reconnecting or replacing an MCP client session does not lose the active Project Session or restart Bridge lifecycle recovery.
 - Cancelling a pending MCP request does not consume its completion; the latest unacknowledged attention is replayed after reconnect.
 - Codex can use previous turn context in the same thread.
@@ -179,7 +187,8 @@ Scope:
 - The stable `dist/index.js` stdio entrypoint is a stateless adapter: it starts the Core only when absent, proxies MCP tool calls, and never runs startup recovery or owns Runtime connections.
 - Direct Streamable HTTP clients and any number of stdio adapters share that same Core.
 - Core startup acquires the HTTP listener before opening durable state, then transitions `STARTING -> RECONCILING -> READY`.
-- The Core health contract exposes protocol/build identity; a stdio Adapter rejects an incompatible running Core instead of silently reusing or killing it.
+- The Core health contract exposes protocol/build identity so a stdio Adapter detects an incompatible running Core instead of silently reusing old code.
+- An incompatible idle Core accepts an authenticated safe-upgrade request, drains, and is replaced automatically by the stdio Adapter; active turns, commands, approvals, Project Session transitions, or Runtime transitions block replacement.
 - Core shutdown stops accepting requests, closes MCP sessions, closes every App Server WebSocket, and finally closes SQLite.
 - Startup recovery uses `thread/read` to reconcile locally active turns with App Server state.
 - Pending approvals from a previous App Server connection become `orphaned`; Bridge never fabricates an approve/deny response on a replacement connection.
@@ -194,6 +203,7 @@ Acceptance:
 - A second Core cannot acquire the configured loopback port and therefore cannot touch the same lifecycle state.
 - Core restart does not create a new Codex thread and does not leave a previous-connection approval actionable.
 - Delta-heavy Codex output does not grow the SQLite event stream.
+- Rebuilding while Core is idle allows the next `/mcp` connection to replace it automatically; rebuilding during active work leaves the old Core running and, when the Bridge protocol is compatible, keeps `/mcp` usable through that Core until a later idle upgrade.
 
 ### Phase 6 - Token And Context Governance
 
@@ -208,6 +218,7 @@ Deliverables:
 - Default short summaries in `task_status`, `task_events`, and `task_diff`.
 - Codex model and reasoning defaults are inherited from the user's Codex configuration unless explicit `CODEX_BRIDGE_CODEX_*` overrides are set.
 - `task_send.runChecks`, defaulting to `false`, so Claude decides when Codex should spend extra commands on verification.
+- Full durable task contract delivery at thread start/resume instead of repetition in every `turn/start`.
 
 Acceptance:
 
@@ -216,6 +227,7 @@ Acceptance:
 - Claude can compact the thread without sending full logs back into context.
 - `npm run smoke:context` proves the 70%/85% governance flow without starting a real Runtime Host.
 - Simple deterministic edits can skip verification commands by omitting `runChecks` or setting it to `false`.
+- Repeated follow-up turns do not resend title, requirements or acceptance criteria in their turn input.
 
 ### Phase 6.5 - Visible Codex TUI
 
@@ -225,14 +237,18 @@ Deliverables:
 - Default TUI mode attaches to the opened task thread through the same App Server endpoint.
 - TUI launch result is persisted as task events.
 - TUI ownership and launch claims are persisted in SQLite instead of a process-local cache.
+- TUI exit, relaunch wait, retry-window and circuit-breaker state are persisted so Core restart can reattach monitoring without opening a duplicate window.
 - `task_open` may report a TUI launch failure without discarding the durable session; in visible TUI modes, `task_send` must not start a turn unless the TUI is running.
 - `task_send` still uses only App Server `turn/start` and never uses the TUI process for execution.
 
 Acceptance:
 
 - Opening a task starts or reuses one App Server Runtime Host and opens one visible Codex TUI window for the task thread.
-- Reopening the same project, including from another MCP process, reuses the persisted TUI instance.
+- Reopening the same confirmed task, including from another MCP process, reuses the persisted TUI instance.
 - If the persisted TUI process exited between turns, the next `task_send` relaunches it before `turn/start`; a relaunch failure blocks the turn instead of running silently in the background.
+- With the default `active-turn` policy, a TUI that exits during a running or approval-blocked turn is relaunched on the same Runtime and Thread with bounded backoff; an idle exit waits for the next `task_send`.
+- Three relaunch attempts in one 60-second window open a circuit; `task_open(mode=reuse, expectedTaskId=...)` resets it for an explicit manual retry.
+- Core restart reattaches monitors to live TUI PIDs and resumes persisted relaunch waits without calling `thread/start`, `thread/resume`, or `turn/start`.
 - Claude follow-up turns continue through WebSocket `turn/start`.
 - Disabling the TUI through `CODEX_BRIDGE_CODEX_TUI_MODE=off` keeps headless behavior for automation.
 
@@ -247,7 +263,7 @@ Deliverables:
 - Streamable HTTP multi-client smoke test that lists the final 10-tool surface through the MCP SDK and proves one Core survives client disconnects.
 - Compiled stdio adapter smoke test that starts two clients, proves they share one auto-started Core PID, and proves the Core outlives both adapters.
 - Attention delivery smoke test that proves approval idempotency and approval-to-completion waiting without model-level polling.
-- Project Session smoke test that proves concurrent open, MCP restart reuse, path normalization, explicit session rotation, and TUI revalidation before follow-up turns.
+- Project Session smoke test that proves stable orchestrator binding, cross-session reuse rejection, v3-to-v4 storage migration, concurrent open, MCP restart reuse, path normalization, explicit session rotation, compact turn input, and TUI revalidation before follow-up turns.
 - Real Runtime Host E2E that verifies one runtime endpoint and one task thread across two turns.
 - Bridge restart recovery smoke test that reconnects an already-alive endpoint and calls `thread/resume` without `thread/start`.
 - Runtime Host startup log split into `.host.log`, `.host.stdout.log`, and `.host.stderr.log` so the window stays readable on the rare occasion it's made visible.
@@ -274,6 +290,7 @@ Acceptance:
 | One Runtime Host window (hidden by default) | RuntimeHostManager |
 | One App Server process per runtime | PowerShell script builder |
 | One thread per task | TaskService and SQLite constraints |
+| One Codex session per orchestrator session | `orchestrator_session_binding`, `TaskOpenSchema` and TaskService reuse guards |
 | `thread/start` only in `task_open` | TaskService |
 | `turn/start` for follow-up work | TaskService |
 | `thread/resume` for recovery | RecoveryService and client loaded-thread tracking |

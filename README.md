@@ -22,7 +22,7 @@ Claude 是默认、最清晰的协作入口；如果你已经使用 Codex 作为
 
 | 真实开发中的问题 | Codex Bridge MCP 的做法 |
 | --- | --- |
-| 需求补充几轮后，执行上下文散失 | 一个任务持续绑定同一个 Codex 线程，后续要求进入同一执行链 |
+| 需求补充几轮后，执行上下文散失或串入别的会话 | 一个编排会话永久绑定一个 Task 和 Codex Thread，后续要求只进入自己的执行链 |
 | 同一项目反复启动执行环境 | 一个 `projectRoot` 复用一个活跃 Runtime Host |
 | 高风险命令不该被自动放行 | Codex 的审批请求由任务编排者明确批准或拒绝，Bridge 不会自动批准 |
 | Claude、Bridge 或电脑重启后任务失联 | 保存任务、线程、事件和队列状态；优先重连，必要时恢复已知线程 |
@@ -49,8 +49,8 @@ Codex   在真实仓库中修改代码、执行命令、完成验证
 
 一次任务通常只有下面几步：
 
-1. Claude 用 `task_open` 连接项目会话；Bridge 默认复用该项目已经绑定的 Task、Codex 线程和 TUI，仅在没有会话时创建。
-2. Claude 用 `task_send` 发送补充要求；Bridge 会先确认同一线程的可见 TUI 仍在运行，再启动 Codex turn，并保持等待直到审批、完成、失败或中断。如果窗口已经退出，`task_send` 会拒绝转入无窗口后台执行，并要求先用 `task_open` 的 `mode: "reuse"` 恢复该项目会话。客户端支持 MCP progress 时，等待期间 Bridge 会发送轻量进度心跳；即使 MCP 调用被取消，最终注意力事件也会先持久化，重连后由 `task_open`、`task_send` 或 `task_status` 重放。只有显式配置 `CODEX_BRIDGE_CODEX_TUI_MODE=off` 才允许无窗口执行。
+1. Claude 用 `task_open` 打开项目任务，并传入 `orchestrator: { kind: "claude", sessionId: "<Claude 对话的稳定 ID>" }`。同一 Claude 对话始终复用该 ID，Bridge 会把它永久绑定到一个 Task 和 Codex Thread；另一个 Claude/Codex/Cursor 会话不能静默接入。相同项目里的独立工作使用新的编排会话 ID 和 `mode: "new"`。
+2. Claude 用 `task_send` 发送补充要求。完整 Task 标题、requirements 和验收条件只在线程创建或恢复时作为 developer instructions 注入；普通 `turn/start` 只携带本轮增量 instruction 和检查策略，既保持任务边界，也避免每轮重复消耗 Token。Bridge 会先确认同一线程的可见 TUI 仍在运行，再启动 Codex turn，并保持等待直到审批、完成、失败或中断。如果窗口在空闲阶段退出，下一次 `task_send` 会先在原 Project Session、Runtime 和 Thread 上恢复 TUI，再调用 `turn/start`；恢复失败会阻止该 turn，不会静默转入无窗口后台执行。客户端支持 MCP progress 时，等待期间 Bridge 会发送轻量进度心跳；即使 MCP 调用被取消，最终注意力事件也会先持久化，重连后由 `task_open`、`task_send` 或 `task_status` 重放。只有显式配置 `CODEX_BRIDGE_CODEX_TUI_MODE=off` 才允许无窗口执行。
 3. Codex 需要授权时，`task_send` 会直接返回审批注意力事件；Claude 通过 `approval_decide` 作出决定，并继续等待同一 turn 的下一个注意力事件。
 4. Codex 完成一轮后，Claude 用 `task_diff` 审查真实改动；不满足验收条件就继续发送下一轮要求。`task_status` 和 `task_events` 只用于诊断与审计，不承担正常通知职责。
 5. 长任务接近上下文限制时，Claude 可以调用 `task_compact`，在原线程中压缩上下文。
@@ -59,7 +59,7 @@ Codex   在真实仓库中修改代码、执行命令、完成验证
 
 ### 持续执行，而不是一次转发
 
-`taskId` 与 `codexThreadId` 一一绑定。Bridge 将项目当前会话保存在 SQLite 中，因此即使 MCP 重连、进程重启或编排者暂时丢失 `taskId`，再次调用 `task_open` 也会返回原 Task 和线程，不会意外打开第二个 TUI。只有明确传入 `mode: "new"`，才会创建隔离的新会话。
+`orchestrator.kind + orchestrator.sessionId`、`taskId` 与 `codexThreadId` 形成一一绑定，并持久化在 SQLite。这里的 `sessionId` 优先使用 Claude、Codex 或 Cursor 自己提供的稳定对话身份；如果客户端没有暴露该值，就在一次对话第一次 `task_open` 时生成一个，并在该对话内始终复用。临时 stdio/HTTP MCP transport session 会在重连时变化，Bridge 明确不拿它做任务身份。当该 Task 仍是项目当前活跃会话时，同一编排会话再次 `task_open` 即使标题或需求文本变化，也只会返回原 Task 和 Thread。若另一个会话已用 `mode:new` 显式换代，旧会话的绑定仍保留，但必须用返回的原 `taskId` 调用 `task_recover` 才会显式切回。不同编排会话若碰到已经绑定的活跃 Task 会在 Runtime/TUI 副作用前拒绝；只有新的编排会话显式传入 `mode: "new"` 才创建隔离线程。旧客户端无法提供稳定编排身份时，仍可用 `expectedTaskId` 精确复用。
 
 ### Codex 也可以调度 Codex
 
@@ -148,6 +148,8 @@ Claude Code 使用同一个 `node dist/index.js` stdio 命令即可。多个 Cod
 
 每次 `npm run build` 都会生成新的 Bridge build ID。stdio Adapter 发现端口上仍是旧 build 的 Core 时会明确报告 PID 和版本不兼容，不会静默复用旧代码或自动终止正在运行的任务；确认没有活跃任务后再重启该 Core。进度心跳默认每 15 秒发送一次，可用 `CODEX_BRIDGE_ATTENTION_HEARTBEAT_MS` 调整。
 
+可见 TUI 默认采用 `CODEX_BRIDGE_CODEX_TUI_AUTO_RELAUNCH=active-turn`：正在执行或等待审批时，窗口意外退出会按 `0s / 2s / 5s` 在原会话上最多重拉 3 次；空闲时不主动弹窗，由下一次 `task_send` 惰性恢复。连续失败会打开 60 秒熔断，带原稳定编排身份的 `task_open(mode=reuse)`（旧客户端则加 `expectedTaskId`）可执行一次明确的人工重试并重置计数。也可以设为 `active-session`（活跃项目会话即主动恢复）或 `off`（完全关闭自动恢复，窗口退出后必须显式恢复已知 Task）。`task_status.codexTui` 会返回当前 PID、状态、重试次数、下次重试时间和最近错误。
+
 需要调试或让支持 Streamable HTTP 的客户端直接连接时，可以显式启动 Core：
 
 ```powershell
@@ -160,20 +162,16 @@ npm start
 
 Bridge Core 默认采用**按需启动**，不是 Windows 开机自启服务：第一次由 Claude Code 或 Codex 建立 MCP 连接时，stdio Adapter 会在本机没有可用 Core 的情况下拉起共享 Bridge Core；任务需要执行环境时，再由 Core 的 Runtime Host Manager 为对应项目启动 `codex app-server`。关闭单个客户端不会停止 Core，也不会中断已经提交的 Codex turn。日常使用不需要每次手工执行 `npm start`；该命令主要用于前台诊断。
 
-构建升级后，新的 Adapter 不会自动终止仍在运行的旧 Core，因为旧进程中可能还有任务或待审批操作。此时仅反复执行 `/mcp` 无法替换不兼容的旧进程，客户端会返回 `Failed to reconnect to codex-bridge: -32000`。可以先读取健康信息：
+每次构建都会生成新的 Bridge build ID。Adapter 发现 43110 上运行的是旧构建时，会先通过本地 Bearer Token 请求安全升级：Core 检查运行中的 turn、队列命令、审批、Project Session 创建/恢复和 Runtime 迁移状态；全部为空时，旧 Core 自动进入 `DRAINING`、关闭连接并退出，Adapter 随即拉起新 Core，再完成本次 MCP 连接。这个过程不会重建 Task 或 Codex Thread，也不需要手工查找和停止 PID。
+
+如果仍有活跃操作，Core 会返回具体 blocker，并保持旧 Core 继续运行，不会为了升级中断任务；只要 Bridge protocol 兼容，本次 `/mcp` 仍会连接旧 Core，让当前任务继续使用。操作结束后再次执行 `/mcp` 即可自动切换到新构建。健康信息仍可用于诊断：
 
 ```powershell
 $health = Invoke-RestMethod http://127.0.0.1:43110/healthz
 $health
 ```
 
-如果返回的 `protocolVersion` 或 `buildId` 与当前构建不一致，先通过原客户端确认没有运行中的任务和待审批操作，再停止健康信息中给出的旧 PID：
-
-```powershell
-Stop-Process -Id $health.pid
-```
-
-随后重新连接 MCP 即可，由 stdio Adapter 按需启动当前构建的 Core；Claude Code 可重新执行 `/mcp`，Codex 可重新加载 MCP 配置。若需要查看启动阶段的直接错误，再在项目目录运行 `npm start` 进行前台诊断。
+若安全升级被阻止，错误中会列出 `activeTurns`、`runningCommands`、`queuedCommands`、`activeApprovals`、`transitionalProjectSessions` 或 `transitionalRuntimes` 中的非零项。若需要查看启动阶段的直接错误，再在项目目录运行 `npm start` 进行前台诊断。
 
 > 不要在任务执行中或存在待审批操作时直接停止 Core。Bridge 会持久化可恢复状态，但不会假装未确认的外部操作一定没有发生。
 
@@ -181,8 +179,9 @@ Stop-Process -Id $health.pid
 
 | 你想做什么 | 编排者使用的能力 |
 | --- | --- |
-| 连接或开始一项持续任务 | `task_open`（默认 `mode: "reuse"`） |
-| 明确开启隔离的新线程 | `task_open`（`mode: "new"`） |
+| 开始或继续当前编排会话 | `task_open`（传稳定的 `orchestrator.kind + sessionId`） |
+| 旧客户端精确恢复已知任务 | `task_open`（`mode: "reuse"` + `expectedTaskId`） |
+| 明确开启隔离的新线程 | 新编排会话身份 + `task_open(mode: "new")` |
 | 在原任务上继续补充要求 | `task_send` |
 | MCP 调用取消或重连后继续等待 | `task_await`；未 ACK 的结果也会由 `task_open` / `task_send` 重放 |
 | 诊断进度、队列和历史事件 | `task_status`、`task_events` |

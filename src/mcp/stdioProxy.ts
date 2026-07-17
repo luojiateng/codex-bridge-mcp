@@ -38,7 +38,7 @@ export async function startStdioProxy(): Promise<void> {
   const endpoint = formatBridgeHttpEndpoint(address);
   const { token } = await loadOrCreateMcpToken(config.dataDir);
   const logger = new JsonlLogger(config.logsDir);
-  await ensureCoreReady(endpoint);
+  await ensureCoreReady(endpoint, token);
 
   const upstreamTransport = new StreamableHTTPClientTransport(new URL(endpoint), {
     requestInit: {
@@ -126,20 +126,32 @@ export async function startStdioProxy(): Promise<void> {
   await server.connect(new StdioServerTransport());
 }
 
-async function ensureCoreReady(endpoint: string): Promise<CoreHealth> {
-  const initial = await probeCore(endpoint);
-  if (initial?.status === "READY") {
-    return assertCompatibleCore(initial);
-  }
-  if (!initial) {
-    await spawnCoreDaemon();
-  }
-
+async function ensureCoreReady(endpoint: string, token: string): Promise<CoreHealth> {
   const deadline = Date.now() + CORE_START_TIMEOUT_MS;
+  let spawnAttempted = false;
+  let upgradeRequestedPid: number | null = null;
   while (Date.now() < deadline) {
     const health = await probeCore(endpoint);
+    if (!health) {
+      if (!spawnAttempted) {
+        await spawnCoreDaemon();
+        spawnAttempted = true;
+      }
+      await delay(100);
+      continue;
+    }
     if (health?.status === "READY") {
-      return assertCompatibleCore(health);
+      if (isCompatibleCore(health)) {
+        return health;
+      }
+      if (upgradeRequestedPid !== health.pid) {
+        const outcome = await requestCoreUpgrade(endpoint, token, health);
+        if (outcome === "continue-current") {
+          return health;
+        }
+        upgradeRequestedPid = health.pid;
+        spawnAttempted = false;
+      }
     }
     await delay(100);
   }
@@ -195,19 +207,73 @@ async function probeCore(endpoint: string): Promise<CoreHealth | null> {
   return null;
 }
 
-function assertCompatibleCore(health: CoreHealth): CoreHealth {
-  if (
-    health.protocolVersion !== BRIDGE_PROTOCOL_VERSION ||
-    health.buildId !== BRIDGE_BUILD_ID
-  ) {
+function isCompatibleCore(health: CoreHealth): boolean {
+  return (
+    health.protocolVersion === BRIDGE_PROTOCOL_VERSION &&
+    health.buildId === BRIDGE_BUILD_ID
+  );
+}
+
+async function requestCoreUpgrade(
+  endpoint: string,
+  token: string,
+  health: CoreHealth,
+): Promise<"draining" | "continue-current"> {
+  let response: Response;
+  try {
+    response = await fetch(new URL("/admin/upgrade", endpoint), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        targetProtocolVersion: BRIDGE_PROTOCOL_VERSION,
+        targetBuildId: BRIDGE_BUILD_ID,
+      }),
+      signal: AbortSignal.timeout(2_000),
+    });
+  } catch (error) {
+    if (!(await probeCore(endpoint))) {
+      return "draining";
+    }
     throw new Error(
-      `Codex Bridge Core PID ${health.pid} is running an incompatible build ` +
-        `(core protocol=${health.protocolVersion ?? "unknown"}, build=${health.buildId ?? "unknown"}; ` +
-        `adapter protocol=${BRIDGE_PROTOCOL_VERSION}, build=${BRIDGE_BUILD_ID}). ` +
-        "Finish or recover active tasks, then restart that Core before reconnecting.",
+      `Codex Bridge could not request automatic upgrade from Core PID ${health.pid}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
     );
   }
-  return health;
+  const payload = await response.json().catch(() => null) as
+    | { status?: string; blockers?: Record<string, unknown> }
+    | null;
+  if (response.status === 200 || response.status === 202) {
+    return "draining";
+  }
+  if (response.status === 409) {
+    const blockers = payload?.blockers
+      ? Object.entries(payload.blockers)
+          .filter(([, value]) => typeof value === "number" && value > 0)
+          .map(([key, value]) => `${key}=${value}`)
+          .join(", ")
+      : "unknown activity";
+    if (health.protocolVersion === BRIDGE_PROTOCOL_VERSION) {
+      return "continue-current";
+    }
+    throw new Error(
+      `Codex Bridge cannot continue through Core PID ${health.pid} because its protocol is incompatible and automatic upgrade is blocked by active work (${blockers}). The existing Core was left running and no task was interrupted.`,
+    );
+  }
+  if (response.status === 404) {
+    if (health.protocolVersion === BRIDGE_PROTOCOL_VERSION) {
+      return "continue-current";
+    }
+    throw new Error(
+      `Codex Bridge Core PID ${health.pid} predates automatic upgrade support. Its data was left untouched; stop this one legacy Core once, then future builds will switch automatically when idle.`,
+    );
+  }
+  throw new Error(
+    `Codex Bridge Core PID ${health.pid} rejected automatic upgrade with HTTP ${response.status}.`,
+  );
 }
 
 function delay(milliseconds: number): Promise<void> {

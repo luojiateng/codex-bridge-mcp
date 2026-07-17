@@ -109,6 +109,10 @@ export class BridgeHttpServer {
       });
       return;
     }
+    if (url.pathname === "/admin/upgrade") {
+      await this.handleUpgradeRequest(request, response);
+      return;
+    }
     if (url.pathname !== this.options.path) {
       sendJson(response, 404, { error: "Not found" });
       return;
@@ -163,6 +167,70 @@ export class BridgeHttpServer {
 
     response.setHeader("Allow", "GET, POST, DELETE");
     sendJson(response, 405, { error: "Method not allowed" });
+  }
+
+  private async handleUpgradeRequest(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    if (request.method !== "POST") {
+      response.setHeader("Allow", "POST");
+      sendJson(response, 405, { error: "Method not allowed" });
+      return;
+    }
+    if (!isAllowedOrigin(request.headers.origin)) {
+      sendJson(response, 403, { error: "Origin is not allowed" });
+      return;
+    }
+    if (!hasValidBearerToken(request.headers.authorization, this.options.authToken)) {
+      response.setHeader("WWW-Authenticate", "Bearer");
+      sendJson(response, 401, { error: "Unauthorized" });
+      return;
+    }
+    const body = await readJsonBody(request);
+    const targetBuildId =
+      body &&
+      typeof body === "object" &&
+      "targetBuildId" in body &&
+      typeof body.targetBuildId === "string"
+        ? body.targetBuildId
+        : null;
+    if (targetBuildId === BRIDGE_BUILD_ID) {
+      sendJson(response, 200, {
+        status: "current",
+        pid: process.pid,
+        buildId: BRIDGE_BUILD_ID,
+      });
+      return;
+    }
+    const readiness = this.core.beginUpgrade();
+    if (!readiness.safe) {
+      sendJson(response, 409, {
+        status: "blocked",
+        pid: process.pid,
+        buildId: BRIDGE_BUILD_ID,
+        targetBuildId,
+        state: readiness.state,
+        blockers: readiness.blockers,
+      });
+      return;
+    }
+    response.setHeader("Connection", "close");
+    sendJson(response, 202, {
+      status: "draining",
+      pid: process.pid,
+      buildId: BRIDGE_BUILD_ID,
+      targetBuildId,
+    });
+    setImmediate(() => {
+      void this.stop().catch((error: unknown) => {
+        console.error(
+          `Codex Bridge automatic upgrade shutdown failed: ${
+            error instanceof Error ? error.stack ?? error.message : String(error)
+          }`,
+        );
+      });
+    });
   }
 
   private async initializeSession(

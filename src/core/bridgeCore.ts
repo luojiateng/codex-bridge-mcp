@@ -4,7 +4,7 @@ import { DiffService } from "../review/diffService.js";
 import { RuntimeHostManager } from "../runtime/runtimeHostManager.js";
 import { TuiWindowManager } from "../runtime/tuiWindowManager.js";
 import { JsonlLogger } from "../storage/jsonlLogger.js";
-import { SqliteStore } from "../storage/sqlite.js";
+import { type CoreUpgradeBlockers, SqliteStore } from "../storage/sqlite.js";
 import { CompactService } from "../task/compactService.js";
 import { ProjectSessionCoordinator } from "../task/projectSessionCoordinator.js";
 import { RecoveryService } from "../task/recoveryService.js";
@@ -21,6 +21,12 @@ export interface BridgeCoreServices {
   taskService: TaskService;
   compactService: CompactService;
   recoveryService: RecoveryService;
+}
+
+export interface CoreUpgradeReadiness {
+  safe: boolean;
+  state: BridgeCoreState;
+  blockers: CoreUpgradeBlockers;
 }
 
 /**
@@ -58,6 +64,34 @@ export class BridgeCore {
       compactService: this.compactService,
       recoveryService: this.recoveryService,
     };
+  }
+
+  getUpgradeReadiness(): CoreUpgradeReadiness {
+    const blockers = this.store?.getCoreUpgradeBlockers() ?? {
+      activeTurns: 0,
+      runningCommands: 0,
+      queuedCommands: 0,
+      activeApprovals: 0,
+      transitionalProjectSessions: 0,
+      transitionalRuntimes: 0,
+    };
+    return {
+      safe:
+        this.currentState === "READY" &&
+        Object.values(blockers).every((count) => count === 0),
+      state: this.currentState,
+      blockers,
+    };
+  }
+
+  beginUpgrade(): CoreUpgradeReadiness {
+    const readiness = this.getUpgradeReadiness();
+    if (readiness.safe) {
+      // Reserve lifecycle ownership synchronously so no new MCP request can
+      // start work between the blocker check and the deferred HTTP shutdown.
+      this.currentState = "DRAINING";
+    }
+    return readiness;
   }
 
   start(): Promise<void> {

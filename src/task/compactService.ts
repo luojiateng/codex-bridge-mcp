@@ -2,6 +2,7 @@ import { CodexClientPool } from "../codex/codexAppServerClient.js";
 import { RuntimeHostManager } from "../runtime/runtimeHostManager.js";
 import { JsonlLogger } from "../storage/jsonlLogger.js";
 import { SqliteStore } from "../storage/sqlite.js";
+import { buildCodexDeveloperInstructions } from "./codexInstruction.js";
 
 export class CompactService {
   constructor(
@@ -18,7 +19,16 @@ export class CompactService {
     }
     const runtime = await this.runtimeHostManager.ensureExistingRuntime(task.runtimeHostId);
     const client = await this.clientPool.getOrConnect(runtime.endpoint);
-    await client.compactThread(task.codexThreadId, task.projectRoot);
+    await client.compactThread(
+      task.codexThreadId,
+      task.projectRoot,
+      buildCodexDeveloperInstructions({
+        taskId: task.id,
+        title: task.title,
+        requirements: task.requirements,
+        acceptanceCriteria: task.acceptanceCriteria,
+      }),
+    );
     const event = this.store.appendEvent({
       taskId: task.id,
       runtimeHostId: runtime.id,

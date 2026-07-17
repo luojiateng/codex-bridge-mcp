@@ -48,6 +48,7 @@ try {
     tools: tools.tools.map((tool) => tool.name),
   });
 
+  const demoSessionId = `claude-mcp-demo-${process.pid}-${Date.now()}`;
   const opened = await callToolJson("task_open", {
     projectRoot: fixtureRoot,
     title: `Claude MCP Demo ${new Date().toISOString()}`,
@@ -59,6 +60,7 @@ try {
       "claude-demo.txt contains CLAUDE_MCP_DEMO_TURN_1 and CLAUDE_MCP_DEMO_TURN_2.",
       "Claude reviews task_diff after Codex completes.",
     ],
+    orchestrator: { kind: "claude", sessionId: demoSessionId },
   });
   logStep("Claude -> task_open", summarize(opened));
 

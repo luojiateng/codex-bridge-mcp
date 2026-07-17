@@ -36,6 +36,39 @@ const health = (await healthResponse.json()) as {
 };
 assert.equal(health.protocolVersion, BRIDGE_PROTOCOL_VERSION);
 assert.equal(health.buildId, BRIDGE_BUILD_ID);
+assert.equal(
+  (
+    await fetch(new URL("/admin/upgrade", server.endpoint), {
+      method: "POST",
+      body: JSON.stringify({ targetBuildId: "unauthorized-build" }),
+    })
+  ).status,
+  401,
+);
+assert.equal(
+  (
+    await fetch(new URL("/admin/upgrade", server.endpoint), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        Origin: "https://example.com",
+      },
+      body: JSON.stringify({ targetBuildId: "disallowed-origin-build" }),
+    })
+  ).status,
+  403,
+);
+const currentBuildResponse = await fetch(new URL("/admin/upgrade", server.endpoint), {
+  method: "POST",
+  headers: {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({ targetBuildId: BRIDGE_BUILD_ID }),
+});
+assert.equal(currentBuildResponse.status, 200);
+assert.equal((await healthResponseFor(server.endpoint)).buildId, BRIDGE_BUILD_ID);
 
 const first = createClient("first");
 const second = createClient("second");
@@ -57,7 +90,13 @@ try {
   assert.deepEqual(firstTools.tools.map((tool) => tool.name).sort(), expected);
   assert.deepEqual(secondTools.tools.map((tool) => tool.name).sort(), expected);
   assert.equal(core.state, "READY");
-  assert.match(first.getInstructions() ?? "", /durable active session/);
+  assert.match(first.getInstructions() ?? "", /stable conversation\/session identifier/);
+  const taskOpenTool = firstTools.tools.find((tool) => tool.name === "task_open");
+  assert(taskOpenTool);
+  assert.deepEqual(
+    (taskOpenTool.inputSchema.properties?.orchestrator as { required?: string[] })?.required,
+    ["kind", "sessionId"],
+  );
 
   await first.close();
   assert.equal(core.state, "READY", "MCP client disconnect must not stop the Bridge Core");
@@ -83,6 +122,12 @@ try {
 
 assert.equal(core.state, "STOPPED");
 console.log("MCP Streamable HTTP multi-client lifecycle smoke test passed.");
+
+async function healthResponseFor(endpoint: string): Promise<{ buildId: string }> {
+  const response = await fetch(new URL("/healthz", endpoint));
+  assert.equal(response.status, 200);
+  return (await response.json()) as { buildId: string };
+}
 
 function createClient(suffix: string): Client {
   return new Client(

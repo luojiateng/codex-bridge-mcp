@@ -26,6 +26,11 @@ export class RecoveryService {
     runtimeHostId: string;
     runtimeEndpoint: string;
     codexThreadId: string;
+    orchestratorBinding: {
+      id: string;
+      kind: string;
+      sessionId: string;
+    } | null;
     codexTui: {
       launched: boolean;
       mode: "off" | "remote" | "resume";
@@ -45,7 +50,12 @@ export class RecoveryService {
     await client.ensureThreadReady(
       task.codexThreadId,
       task.projectRoot,
-      buildCodexDeveloperInstructions(),
+      buildCodexDeveloperInstructions({
+        taskId: task.id,
+        title: task.title,
+        requirements: task.requirements,
+        acceptanceCriteria: task.acceptanceCriteria,
+      }),
     );
     this.store.updateProjectSessionRuntime(session.id, runtime.id);
     const activeSession = this.store.getProjectSessionById(session.id) ?? session;
@@ -58,6 +68,7 @@ export class RecoveryService {
         endpoint: runtime.endpoint,
         threadId: task.codexThreadId,
       },
+      { trigger: "task_recover" },
     ).catch((error: unknown) => ({
       launched: false,
       mode: "off" as const,
@@ -80,11 +91,15 @@ export class RecoveryService {
       },
     });
     await this.logger.append("tasks", task.id, event);
+    const binding = this.store.getOrchestratorBindingByTaskId(task.id);
     return {
       taskId: task.id,
       runtimeHostId: runtime.id,
       runtimeEndpoint: runtime.endpoint,
       codexThreadId: task.codexThreadId,
+      orchestratorBinding: binding
+        ? { id: binding.id, kind: binding.kind, sessionId: binding.sessionId }
+        : null,
       codexTui,
       status: "recovered",
     };

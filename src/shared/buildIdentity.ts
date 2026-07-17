@@ -5,6 +5,10 @@ export const BRIDGE_PROTOCOL_VERSION = 2;
 export const BRIDGE_BUILD_ID = readBuildId();
 
 function readBuildId(): string {
+  const override = process.env.CODEX_BRIDGE_BUILD_ID_OVERRIDE?.trim();
+  if (override) {
+    return override;
+  }
   const candidates = [
     new URL("../build-id.txt", import.meta.url),
     new URL("../../dist/build-id.txt", import.meta.url),

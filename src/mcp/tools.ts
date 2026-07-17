@@ -52,7 +52,7 @@ export function registerTools(
   compactService: CompactService,
   recoveryService: RecoveryService,
 ): void {
-  server.tool("task_open", "Attach to the project's durable active Codex task/thread, or explicitly open a new isolated session with mode=new.", TaskOpenSchema.shape, async (input) =>
+  server.tool("task_open", "Open or continue the Codex task bound to a stable orchestrator conversation identity. Pass orchestrator.kind and orchestrator.sessionId on every conversation; legacy clients must use expectedTaskId for reuse. Use mode=new only for intentionally independent work.", TaskOpenSchema.shape, async (input) =>
     jsonResult(await taskService.openTask(TaskOpenSchema.parse(input))),
   );
 

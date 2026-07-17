@@ -220,8 +220,12 @@ export class CodexAppServerClient extends EventEmitter {
     return turnId;
   }
 
-  async compactThread(threadId: string, cwd?: string): Promise<void> {
-    await this.ensureThreadReady(threadId, cwd);
+  async compactThread(
+    threadId: string,
+    cwd?: string,
+    developerInstructions?: string,
+  ): Promise<void> {
+    await this.ensureThreadReady(threadId, cwd, developerInstructions);
     const params = { threadId } satisfies ThreadCompactStartParams;
     await this.request("thread/compact/start", params);
   }

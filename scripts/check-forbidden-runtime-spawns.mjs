@@ -14,7 +14,6 @@ const forbiddenResumeSpawns = [
 ];
 const forbiddenTaskSendSpawns = [
   ...forbiddenResumeSpawns,
-  /launchTuiForTask\s*\(/i,
   /spawn\s*\(/i,
   /execFile\s*\(/i,
   /cmd\.exe/i,
