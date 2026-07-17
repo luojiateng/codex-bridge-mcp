@@ -75,6 +75,7 @@ const config: BridgeConfig = {
   codexVerbosity: null,
   codexServiceTier: null,
   codexTuiMode: "off",
+  codexTuiAutoRelaunch: "off",
   runtimeHostWindow: "hidden",
 };
 
@@ -163,6 +164,11 @@ assert.equal(recovered.codexTui.launched, false);
 assert.equal(recovered.codexTui.mode, "off");
 assert.equal(messages.some((message) => message.method === "thread/resume"), true);
 assert.equal(messages.some((message) => message.method === "thread/start"), false);
+const resumeMessage = messages.filter((message) => message.method === "thread/resume").at(-1);
+const resumeDeveloperInstructions = String(resumeMessage?.params?.developerInstructions ?? "");
+assert.match(resumeDeveloperInstructions, new RegExp(`Task ID: ${task.id}`));
+assert.match(resumeDeveloperInstructions, /Title: Recovery Smoke/);
+assert.match(resumeDeveloperInstructions, /Requirements:\nNone specified\./);
 assert.equal(store.getRuntime(runtime.id)?.status, "RUNNING");
 assert.equal(
   store.listEvents(task.id, 0, 20).some((event) => event.eventType === "task_recovered"),

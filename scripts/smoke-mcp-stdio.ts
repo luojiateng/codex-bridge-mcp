@@ -46,9 +46,12 @@ const childEnv = {
   CODEX_BRIDGE_CODEX_TUI_MODE: "off",
   CODEX_BRIDGE_CORE_START_TIMEOUT_MS: "10000",
   CODEX_BRIDGE_ATTENTION_HEARTBEAT_MS: "1000",
+  CODEX_BRIDGE_BUILD_ID_OVERRIDE: "stdio-build-a",
 };
 const first = createClient("first");
 const second = createClient("second");
+const compatibleFallback = createClient("compatible-fallback");
+const upgraded = createClient("upgraded");
 let corePid: number | null = null;
 let seedStore: SqliteStore | null = null;
 
@@ -72,13 +75,19 @@ try {
   const [firstTools, secondTools] = await Promise.all([first.listTools(), second.listTools()]);
   assert.deepEqual(firstTools.tools.map((tool) => tool.name).sort(), expected);
   assert.deepEqual(secondTools.tools.map((tool) => tool.name).sort(), expected);
-  assert.match(first.getInstructions() ?? "", /durable active session/);
+  assert.match(first.getInstructions() ?? "", /stable conversation\/session identifier/);
+  const taskOpenTool = firstTools.tools.find((tool) => tool.name === "task_open");
+  assert(taskOpenTool);
+  assert.deepEqual(
+    (taskOpenTool.inputSchema.properties?.orchestrator as { required?: string[] })?.required,
+    ["kind", "sessionId"],
+  );
 
   const initialHealth = await readHealth(endpoint);
   assert.equal(initialHealth.service, "codex-bridge-mcp");
   assert.equal(initialHealth.status, "READY");
   assert.equal(initialHealth.protocolVersion, 2);
-  assert.ok(initialHealth.buildId.length > 0);
+  assert.equal(initialHealth.buildId, "stdio-build-a");
   corePid = initialHealth.pid;
 
   const timestamp = new Date().toISOString();
@@ -114,6 +123,36 @@ try {
   seedStore = new SqliteStore(path.join(childEnv.CODEX_BRIDGE_DATA_DIR, "bridge.db"));
   seedStore.saveTask(task);
   seedStore.saveTurn(turn);
+
+  const token = (
+    await fs.readFile(path.join(childEnv.CODEX_BRIDGE_DATA_DIR, "mcp-token"), "utf8")
+  ).trim();
+  const blockedUpgradeResponse = await fetch(new URL("/admin/upgrade", endpoint), {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ targetBuildId: "stdio-build-b" }),
+  });
+  assert.equal(blockedUpgradeResponse.status, 409);
+  const blockedUpgrade = (await blockedUpgradeResponse.json()) as {
+    status: string;
+    blockers: { activeTurns: number };
+  };
+  assert.equal(blockedUpgrade.status, "blocked");
+  assert.equal(blockedUpgrade.blockers.activeTurns, 1);
+  assert.equal((await readHealth(endpoint)).pid, corePid);
+  await compatibleFallback.connect(
+    createTransport({
+      ...childEnv,
+      CODEX_BRIDGE_BUILD_ID_OVERRIDE: "stdio-build-b",
+    }),
+  );
+  assert.equal((await compatibleFallback.listTools()).tools.length, expected.length);
+  assert.equal((await readHealth(endpoint)).pid, corePid);
+  assert.equal((await readHealth(endpoint)).buildId, "stdio-build-a");
+  await compatibleFallback.close();
 
   const progressUpdates: Array<{ progress: number; message?: string }> = [];
   const attentionPromise = second.callTool(
@@ -191,9 +230,24 @@ try {
   const afterAllClients = await readHealth(endpoint);
   assert.equal(afterAllClients.pid, corePid, "the shared Core must outlive all stdio adapters");
   assert.equal(afterAllClients.status, "READY");
+
+  await upgraded.connect(
+    createTransport({
+      ...childEnv,
+      CODEX_BRIDGE_BUILD_ID_OVERRIDE: "stdio-build-b",
+    }),
+  );
+  const upgradedHealth = await readHealth(endpoint);
+  assert.notEqual(upgradedHealth.pid, corePid, "an idle incompatible Core must be replaced");
+  assert.equal(upgradedHealth.buildId, "stdio-build-b");
+  assert.equal((await upgraded.listTools()).tools.length, expected.length);
+  corePid = upgradedHealth.pid;
+  await upgraded.close();
 } finally {
   await first.close().catch(() => undefined);
   await second.close().catch(() => undefined);
+  await compatibleFallback.close().catch(() => undefined);
+  await upgraded.close().catch(() => undefined);
   seedStore?.close();
   if (corePid === null) {
     corePid = await readHealth(endpoint).then((health) => health.pid).catch(() => null);

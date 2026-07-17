@@ -19,6 +19,7 @@ export interface BridgeConfig {
   codexVerbosity: "low" | "medium" | "high" | null;
   codexServiceTier: string | null;
   codexTuiMode: "off" | "remote" | "resume";
+  codexTuiAutoRelaunch: "off" | "active-turn" | "active-session";
   runtimeHostWindow: "hidden" | "visible";
 }
 
@@ -51,6 +52,9 @@ export const config: BridgeConfig = {
     process.env.CODEX_BRIDGE_CODEX_TUI_MODE ??
       (parseBoolean(process.env.CODEX_BRIDGE_SHOW_CODEX_TUI, true) ? "resume" : "off"),
   ),
+  codexTuiAutoRelaunch: parseTuiAutoRelaunch(
+    process.env.CODEX_BRIDGE_CODEX_TUI_AUTO_RELAUNCH ?? "active-turn",
+  ),
   runtimeHostWindow: parseRuntimeHostWindow(process.env.CODEX_BRIDGE_RUNTIME_HOST_WINDOW ?? "hidden"),
 };
 
@@ -66,6 +70,12 @@ function parseVerbosity(value: string): BridgeConfig["codexVerbosity"] {
 
 function parseTuiMode(value: string): BridgeConfig["codexTuiMode"] {
   return value === "off" || value === "remote" || value === "resume" ? value : "resume";
+}
+
+function parseTuiAutoRelaunch(value: string): BridgeConfig["codexTuiAutoRelaunch"] {
+  return value === "off" || value === "active-turn" || value === "active-session"
+    ? value
+    : "active-turn";
 }
 
 function parseBoolean(value: string | undefined, defaultValue: boolean): boolean {

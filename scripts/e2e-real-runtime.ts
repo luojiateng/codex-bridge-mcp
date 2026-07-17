@@ -61,6 +61,10 @@ const opened = await taskService.openTask({
     "Two task_send calls keep the same codexThreadId.",
     "Codex edits notes.txt inside the fixture project.",
   ],
+  orchestrator: {
+    kind: "codex",
+    sessionId: `real-runtime-e2e-${process.pid}-${Date.now()}`,
+  },
 });
 
 console.log(`Opened task ${opened.taskId}`);

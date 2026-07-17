@@ -31,6 +31,15 @@ export interface RuntimeHostRecord {
 
 export type ProjectSessionStatus = "CREATING" | "ACTIVE" | "RECOVERING" | "FAILED";
 
+export interface CoreUpgradeBlockers {
+  activeTurns: number;
+  runningCommands: number;
+  queuedCommands: number;
+  activeApprovals: number;
+  transitionalProjectSessions: number;
+  transitionalRuntimes: number;
+}
+
 export interface ProjectSessionRecord {
   id: string;
   projectKey: string;
@@ -53,7 +62,13 @@ export interface ProjectSessionClaim {
   session: ProjectSessionRecord;
 }
 
-export type TuiInstanceStatus = "LAUNCHING" | "RUNNING" | "EXITED" | "STALE" | "FAILED";
+export type TuiInstanceStatus =
+  | "LAUNCHING"
+  | "RUNNING"
+  | "EXITED"
+  | "RELAUNCH_WAIT"
+  | "STALE"
+  | "FAILED";
 
 export interface TuiInstanceRecord {
   sessionId: string;
@@ -65,6 +80,11 @@ export interface TuiInstanceRecord {
   status: TuiInstanceStatus;
   claimToken: string | null;
   claimExpiresAt: string | null;
+  restartAttempts: number;
+  restartWindowStartedAt: string | null;
+  nextRestartAt: string | null;
+  lastExitAt: string | null;
+  lastError: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -82,6 +102,25 @@ export interface TaskRecord {
   tokenBudget: number | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export type OrchestratorKind = "claude" | "codex" | "cursor" | "other";
+
+export interface OrchestratorSessionIdentity {
+  kind: OrchestratorKind;
+  sessionId: string;
+}
+
+export interface OrchestratorSessionBindingRecord extends OrchestratorSessionIdentity {
+  id: string;
+  taskId: string;
+  codexThreadId: string;
+  projectKey: string;
+  projectRoot: string;
+  status: "ACTIVE" | "CLOSED" | "SUPERSEDED";
+  createdAt: string;
+  lastSeenAt: string;
+  closedAt: string | null;
 }
 
 export interface TurnRecord {
@@ -221,6 +260,11 @@ type TuiInstanceRow = {
   status: TuiInstanceStatus;
   claim_token: string | null;
   claim_expires_at: string | null;
+  restart_attempts: number;
+  restart_window_started_at: string | null;
+  next_restart_at: string | null;
+  last_exit_at: string | null;
+  last_error: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -238,6 +282,20 @@ type TaskRow = {
   token_budget: number | null;
   created_at: string;
   updated_at: string;
+};
+
+type OrchestratorSessionBindingRow = {
+  id: string;
+  orchestrator_kind: OrchestratorKind;
+  orchestrator_session_id: string;
+  task_id: string;
+  codex_thread_id: string;
+  project_key: string;
+  project_root: string;
+  status: OrchestratorSessionBindingRecord["status"];
+  created_at: string;
+  last_seen_at: string;
+  closed_at: string | null;
 };
 
 type TurnRow = {
@@ -551,6 +609,7 @@ export class SqliteStore {
     sessionId: string;
     claimToken: string;
     task: TaskRecord;
+    orchestrator?: OrchestratorSessionIdentity;
   }): ProjectSessionRecord {
     const tx = this.db.transaction((): ProjectSessionRecord => {
       const now = nowIso();
@@ -582,6 +641,9 @@ export class SqliteStore {
       const session = this.getProjectSessionById(input.sessionId);
       if (!session) {
         throw new Error(`Project session disappeared after completion: ${input.sessionId}`);
+      }
+      if (input.orchestrator) {
+        this.bindOrchestratorSession({ identity: input.orchestrator, task: input.task });
       }
       return session;
     });
@@ -706,6 +768,17 @@ export class SqliteStore {
     return row ? tuiInstanceFromRow(row) : null;
   }
 
+  listTuiInstances(statuses: TuiInstanceStatus[]): TuiInstanceRecord[] {
+    if (statuses.length === 0) {
+      return [];
+    }
+    const placeholders = statuses.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(`select * from tui_instance where status in (${placeholders}) order by updated_at asc`)
+      .all(...statuses) as TuiInstanceRow[];
+    return rows.map(tuiInstanceFromRow);
+  }
+
   claimTuiLaunch(input: {
     sessionId: string;
     generation: number;
@@ -713,6 +786,7 @@ export class SqliteStore {
     codexThreadId: string;
     claimToken: string;
     claimExpiresAt: string;
+    resetRecovery?: boolean;
   }): { outcome: "launch" | "wait"; instance: TuiInstanceRecord } {
     const tx = this.db.transaction((): {
       outcome: "launch" | "wait";
@@ -727,6 +801,11 @@ export class SqliteStore {
       ) {
         return { outcome: "wait", instance: existing };
       }
+      const sameTarget =
+        existing?.generation === input.generation &&
+        existing.runtimeEndpoint === input.runtimeEndpoint &&
+        existing.codexThreadId === input.codexThreadId;
+      const preserveRecovery = sameTarget && !input.resetRecovery;
       const instance: TuiInstanceRecord = {
         sessionId: input.sessionId,
         generation: input.generation,
@@ -737,6 +816,11 @@ export class SqliteStore {
         status: "LAUNCHING",
         claimToken: input.claimToken,
         claimExpiresAt: input.claimExpiresAt,
+        restartAttempts: preserveRecovery ? existing.restartAttempts : 0,
+        restartWindowStartedAt: preserveRecovery ? existing.restartWindowStartedAt : null,
+        nextRestartAt: null,
+        lastExitAt: preserveRecovery ? existing.lastExitAt : null,
+        lastError: null,
         createdAt: existing?.createdAt ?? now,
         updatedAt: now,
       };
@@ -746,10 +830,14 @@ export class SqliteStore {
           insert into tui_instance (
             session_id, generation, runtime_endpoint, codex_thread_id, pid,
             process_started_at, status, claim_token, claim_expires_at,
+            restart_attempts, restart_window_started_at, next_restart_at,
+            last_exit_at, last_error,
             created_at, updated_at
           ) values (
             @sessionId, @generation, @runtimeEndpoint, @codexThreadId, @pid,
             @processStartedAt, @status, @claimToken, @claimExpiresAt,
+            @restartAttempts, @restartWindowStartedAt, @nextRestartAt,
+            @lastExitAt, @lastError,
             @createdAt, @updatedAt
           )
           on conflict(session_id) do update set
@@ -761,6 +849,11 @@ export class SqliteStore {
             status = excluded.status,
             claim_token = excluded.claim_token,
             claim_expires_at = excluded.claim_expires_at,
+            restart_attempts = excluded.restart_attempts,
+            restart_window_started_at = excluded.restart_window_started_at,
+            next_restart_at = excluded.next_restart_at,
+            last_exit_at = excluded.last_exit_at,
+            last_error = excluded.last_error,
             updated_at = excluded.updated_at
           `,
         )
@@ -781,7 +874,8 @@ export class SqliteStore {
         `
         update tui_instance
         set pid = ?, process_started_at = ?, status = 'RUNNING',
-            claim_token = null, claim_expires_at = null, updated_at = ?
+            claim_token = null, claim_expires_at = null,
+            next_restart_at = null, last_error = null, updated_at = ?
         where session_id = ? and status = 'LAUNCHING' and claim_token = ?
         `,
       )
@@ -802,34 +896,116 @@ export class SqliteStore {
     return instance;
   }
 
-  failTuiLaunch(sessionId: string, claimToken: string): void {
+  failTuiLaunch(sessionId: string, claimToken: string, reason: string): void {
     this.db
       .prepare(
         `
         update tui_instance
-        set status = 'FAILED', claim_token = null, claim_expires_at = null, updated_at = ?
+        set status = 'FAILED', claim_token = null, claim_expires_at = null,
+            next_restart_at = null, last_error = ?, updated_at = ?
         where session_id = ? and status = 'LAUNCHING' and claim_token = ?
         `,
       )
-      .run(nowIso(), sessionId, claimToken);
+      .run(reason, nowIso(), sessionId, claimToken);
   }
 
-  markTuiExited(sessionId: string, pid: number | null): void {
-    this.db
+  markTuiExited(
+    sessionId: string,
+    generation: number,
+    pid: number | null,
+  ): TuiInstanceRecord | null {
+    const result = this.db
       .prepare(
         `
         update tui_instance
-        set status = 'EXITED', claim_token = null, claim_expires_at = null, updated_at = ?
-        where session_id = ? and pid is ? and status = 'RUNNING'
+        set status = 'EXITED', claim_token = null, claim_expires_at = null,
+            next_restart_at = null, last_exit_at = ?, updated_at = ?
+        where session_id = ? and generation = ? and pid is ? and status = 'RUNNING'
         `,
       )
-      .run(nowIso(), sessionId, pid);
+      .run(nowIso(), nowIso(), sessionId, generation, pid);
+    return result.changes === 1 ? this.getTuiInstance(sessionId) : null;
+  }
+
+  scheduleTuiRelaunch(input: {
+    sessionId: string;
+    generation: number;
+    restartAttempts: number;
+    restartWindowStartedAt: string;
+    nextRestartAt: string;
+    reason: string | null;
+  }): TuiInstanceRecord | null {
+    const result = this.db
+      .prepare(
+        `
+        update tui_instance
+        set status = 'RELAUNCH_WAIT', restart_attempts = ?,
+            restart_window_started_at = ?, next_restart_at = ?,
+            last_error = ?, updated_at = ?
+        where session_id = ? and generation = ?
+          and status in ('EXITED', 'FAILED', 'RELAUNCH_WAIT')
+        `,
+      )
+      .run(
+        input.restartAttempts,
+        input.restartWindowStartedAt,
+        input.nextRestartAt,
+        input.reason,
+        nowIso(),
+        input.sessionId,
+        input.generation,
+      );
+    return result.changes === 1 ? this.getTuiInstance(input.sessionId) : null;
+  }
+
+  cancelTuiRelaunch(sessionId: string, generation: number): TuiInstanceRecord | null {
+    const result = this.db
+      .prepare(
+        `
+        update tui_instance
+        set status = 'EXITED', next_restart_at = null, updated_at = ?
+        where session_id = ? and generation = ? and status = 'RELAUNCH_WAIT'
+        `,
+      )
+      .run(nowIso(), sessionId, generation);
+    return result.changes === 1 ? this.getTuiInstance(sessionId) : null;
+  }
+
+  openTuiRelaunchCircuit(input: {
+    sessionId: string;
+    generation: number;
+    restartAttempts: number;
+    restartWindowStartedAt: string;
+    reason: string;
+  }): TuiInstanceRecord | null {
+    const result = this.db
+      .prepare(
+        `
+        update tui_instance
+        set status = 'FAILED', restart_attempts = ?,
+            restart_window_started_at = ?, next_restart_at = null,
+            last_error = ?, updated_at = ?
+        where session_id = ? and generation = ?
+          and status in ('EXITED', 'FAILED', 'RELAUNCH_WAIT')
+        `,
+      )
+      .run(
+        input.restartAttempts,
+        input.restartWindowStartedAt,
+        input.reason,
+        nowIso(),
+        input.sessionId,
+        input.generation,
+      );
+    return result.changes === 1 ? this.getTuiInstance(input.sessionId) : null;
   }
 
   markTuiInstancesStale(runtimeEndpoint: string): TuiInstanceRecord[] {
     const tx = this.db.transaction((): TuiInstanceRecord[] => {
       const rows = this.db
-        .prepare("select * from tui_instance where runtime_endpoint = ? and status = 'RUNNING'")
+        .prepare(
+          "select * from tui_instance where runtime_endpoint = ? and status in ('RUNNING', 'LAUNCHING', 'RELAUNCH_WAIT')",
+        )
         .all(runtimeEndpoint) as TuiInstanceRow[];
       if (rows.length > 0) {
         this.db
@@ -837,7 +1013,7 @@ export class SqliteStore {
             `
             update tui_instance
             set status = 'STALE', updated_at = ?
-            where runtime_endpoint = ? and status = 'RUNNING'
+            where runtime_endpoint = ? and status in ('RUNNING', 'LAUNCHING', 'RELAUNCH_WAIT')
             `,
           )
           .run(nowIso(), runtimeEndpoint);
@@ -860,6 +1036,139 @@ export class SqliteStore {
         "update runtime_host set status = 'RUNNING', last_heartbeat_at = ?, updated_at = ? where id = ?",
       )
       .run(now, now, id);
+  }
+
+  getCoreUpgradeBlockers(): CoreUpgradeBlockers {
+    const row = this.db
+      .prepare(
+        `
+        select
+          (select count(*) from turn where status in ('running', 'awaiting_approval'))
+            as active_turns,
+          (select count(*) from task_command_queue where status = 'running')
+            as running_commands,
+          (select count(*) from task_command_queue where status = 'queued')
+            as queued_commands,
+          (
+            select count(*) from approval
+            inner join turn on turn.task_id = approval.task_id
+              and turn.codex_turn_id = approval.codex_turn_id
+            where approval.decision is null
+              and turn.status in ('running', 'awaiting_approval')
+          ) as active_approvals,
+          (select count(*) from project_session where status in ('CREATING', 'RECOVERING'))
+            as transitional_project_sessions,
+          (
+            select count(*) from runtime_host
+            where status in ('INIT', 'STARTING', 'RECONNECTING', 'RECREATED')
+          ) as transitional_runtimes
+        `,
+      )
+      .get() as {
+      active_turns: number;
+      running_commands: number;
+      queued_commands: number;
+      active_approvals: number;
+      transitional_project_sessions: number;
+      transitional_runtimes: number;
+    };
+    return {
+      activeTurns: row.active_turns,
+      runningCommands: row.running_commands,
+      queuedCommands: row.queued_commands,
+      activeApprovals: row.active_approvals,
+      transitionalProjectSessions: row.transitional_project_sessions,
+      transitionalRuntimes: row.transitional_runtimes,
+    };
+  }
+
+  getOrchestratorBinding(
+    identity: OrchestratorSessionIdentity,
+  ): OrchestratorSessionBindingRecord | null {
+    const row = this.db
+      .prepare(
+        `
+        select * from orchestrator_session_binding
+        where orchestrator_kind = ? and orchestrator_session_id = ?
+        `,
+      )
+      .get(identity.kind, identity.sessionId) as OrchestratorSessionBindingRow | undefined;
+    return row ? orchestratorSessionBindingFromRow(row) : null;
+  }
+
+  getOrchestratorBindingByTaskId(taskId: string): OrchestratorSessionBindingRecord | null {
+    const row = this.db
+      .prepare("select * from orchestrator_session_binding where task_id = ?")
+      .get(taskId) as OrchestratorSessionBindingRow | undefined;
+    return row ? orchestratorSessionBindingFromRow(row) : null;
+  }
+
+  bindOrchestratorSession(input: {
+    identity: OrchestratorSessionIdentity;
+    task: TaskRecord;
+  }): OrchestratorSessionBindingRecord {
+    const canonical = canonicalizeProjectRoot(input.task.projectRoot);
+    const tx = this.db.transaction((): OrchestratorSessionBindingRecord => {
+      const existingIdentity = this.getOrchestratorBinding(input.identity);
+      if (existingIdentity) {
+        if (
+          existingIdentity.taskId !== input.task.id ||
+          existingIdentity.codexThreadId !== input.task.codexThreadId ||
+          existingIdentity.projectKey !== canonical.projectKey ||
+          existingIdentity.status !== "ACTIVE"
+        ) {
+          throw new Error(
+            `Orchestrator session ${input.identity.kind}:${input.identity.sessionId} is already bound to task ${existingIdentity.taskId} and cannot be rebound to ${input.task.id}.`,
+          );
+        }
+        const lastSeenAt = nowIso();
+        this.db
+          .prepare(
+            "update orchestrator_session_binding set last_seen_at = ? where id = ?",
+          )
+          .run(lastSeenAt, existingIdentity.id);
+        return { ...existingIdentity, lastSeenAt };
+      }
+
+      const taskBinding = this.getOrchestratorBindingByTaskId(input.task.id);
+      if (taskBinding) {
+        throw new Error(
+          `Task ${input.task.id} is already bound to orchestrator session ${taskBinding.kind}:${taskBinding.sessionId}.`,
+        );
+      }
+
+      const now = nowIso();
+      const binding: OrchestratorSessionBindingRecord = {
+        id: createId("orchestrator_binding"),
+        kind: input.identity.kind,
+        sessionId: input.identity.sessionId,
+        taskId: input.task.id,
+        codexThreadId: input.task.codexThreadId,
+        projectKey: canonical.projectKey,
+        projectRoot: canonical.projectRoot,
+        status: "ACTIVE",
+        createdAt: now,
+        lastSeenAt: now,
+        closedAt: null,
+      };
+      this.db
+        .prepare(
+          `
+          insert into orchestrator_session_binding (
+            id, orchestrator_kind, orchestrator_session_id, task_id,
+            codex_thread_id, project_key, project_root, status,
+            created_at, last_seen_at, closed_at
+          ) values (
+            @id, @kind, @sessionId, @taskId,
+            @codexThreadId, @projectKey, @projectRoot, @status,
+            @createdAt, @lastSeenAt, @closedAt
+          )
+          `,
+        )
+        .run(binding);
+      return binding;
+    });
+    return tx();
   }
 
   saveTask(task: TaskRecord): void {
@@ -1690,8 +1999,8 @@ export class SqliteStore {
 
   private initSchema(): void {
     const schemaVersion = this.db.pragma("user_version", { simple: true }) as number;
-    if (schemaVersion > 2) {
-      throw new Error(`Bridge database schema ${schemaVersion} is newer than supported version 2.`);
+    if (schemaVersion > 4) {
+      throw new Error(`Bridge database schema ${schemaVersion} is newer than supported version 4.`);
     }
     const schemaPath = fileURLToPath(new URL("schema.sql", import.meta.url));
     this.db.exec(fs.readFileSync(schemaPath, "utf8"));
@@ -1701,11 +2010,16 @@ export class SqliteStore {
     this.ensureColumn("turn", "attention_kind", "text");
     this.ensureColumn("turn", "attention_payload_json", "text");
     this.ensureColumn("turn", "result_json", "text");
+    this.ensureColumn("tui_instance", "restart_attempts", "integer not null default 0");
+    this.ensureColumn("tui_instance", "restart_window_started_at", "text");
+    this.ensureColumn("tui_instance", "next_restart_at", "text");
+    this.ensureColumn("tui_instance", "last_exit_at", "text");
+    this.ensureColumn("tui_instance", "last_error", "text");
     this.enforceLifecycleConstraints();
     this.backfillProjectSessions();
     this.backfillTuiInstances();
     this.backfillPendingApprovalAttention();
-    this.db.pragma("user_version = 2");
+    this.db.pragma("user_version = 4");
   }
 
   private enforceLifecycleConstraints(): void {
@@ -1948,6 +2262,11 @@ function tuiInstanceFromRow(row: TuiInstanceRow): TuiInstanceRecord {
     status: row.status,
     claimToken: row.claim_token,
     claimExpiresAt: row.claim_expires_at,
+    restartAttempts: row.restart_attempts ?? 0,
+    restartWindowStartedAt: row.restart_window_started_at,
+    nextRestartAt: row.next_restart_at,
+    lastExitAt: row.last_exit_at,
+    lastError: row.last_error,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -1967,6 +2286,24 @@ function taskFromRow(row: TaskRow): TaskRecord {
     tokenBudget: row.token_budget,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function orchestratorSessionBindingFromRow(
+  row: OrchestratorSessionBindingRow,
+): OrchestratorSessionBindingRecord {
+  return {
+    id: row.id,
+    kind: row.orchestrator_kind,
+    sessionId: row.orchestrator_session_id,
+    taskId: row.task_id,
+    codexThreadId: row.codex_thread_id,
+    projectKey: row.project_key,
+    projectRoot: row.project_root,
+    status: row.status,
+    createdAt: row.created_at,
+    lastSeenAt: row.last_seen_at,
+    closedAt: row.closed_at,
   };
 }
 

@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import type { CodexNotification } from "../codex/codexProtocol.js";
 import type { CodexServerRequest } from "../codex/codexProtocol.js";
 import { CodexClientPool, type CodexAppServerClient } from "../codex/codexAppServerClient.js";
@@ -20,6 +21,8 @@ import { isHttpReady } from "../runtime/heartbeat.js";
 import { RuntimeHostManager } from "../runtime/runtimeHostManager.js";
 import {
   type CodexTuiWindowResult,
+  type TuiEnsureTrigger,
+  type TuiLifecycleEvent,
   TuiWindowManager,
 } from "../runtime/tuiWindowManager.js";
 import { DiffService } from "../review/diffService.js";
@@ -29,6 +32,8 @@ import { JsonlLogger } from "../storage/jsonlLogger.js";
 import {
   type ApprovalRecord,
   type EventRecord,
+  type OrchestratorSessionBindingRecord,
+  type OrchestratorSessionIdentity,
   type ProjectSessionRecord,
   type RuntimeHostRecord,
   type TaskRecord,
@@ -38,6 +43,7 @@ import {
 import {
   buildCodexDeveloperInstructions,
   buildCodexInstruction,
+  type CodexTaskContract,
 } from "./codexInstruction.js";
 import { TaskQueue } from "./taskQueue.js";
 import {
@@ -52,6 +58,8 @@ export interface TaskOpenInput {
   acceptanceCriteria: unknown[];
   tokenBudget?: number;
   mode?: "reuse" | "new";
+  expectedTaskId?: string;
+  orchestrator?: OrchestratorSessionIdentity;
 }
 
 export interface TaskSendInput {
@@ -68,6 +76,15 @@ export interface TaskOpenResult {
   codexThreadId: string;
   projectSessionId: string;
   sessionGeneration: number;
+  title: string;
+  requestedTitle: string;
+  taskCreatedAt: string;
+  taskUpdatedAt: string;
+  orchestratorBinding: {
+    id: string;
+    kind: string;
+    sessionId: string;
+  } | null;
   codexTui: {
     launched: boolean;
     mode: "off" | "remote" | "resume";
@@ -188,21 +205,26 @@ export class TaskService {
     private readonly bridgeConfig: BridgeConfig = config,
     private readonly projectSessions: ProjectSessionCoordinator = new ProjectSessionCoordinator(store),
     private readonly tuiWindowManager: TuiWindowManager = new TuiWindowManager(store, bridgeConfig),
-  ) {}
+  ) {
+    this.tuiWindowManager.setLifecycleListener((event) => this.recordTuiLifecycleEvent(event));
+  }
 
   start(): Promise<void> {
     if (this.startupRecovery) {
       return this.startupRecovery;
     }
-    this.startupRecovery = this.recoverInterruptedQueue().catch(async (error: unknown) => {
-      await this.logger
-        .append("runtime", "startup", {
-          type: "runtime_dependent_recovery_failed",
-          error: error instanceof Error ? error.message : String(error),
-        })
-        .catch(() => undefined);
-      throw error;
-    });
+    this.tuiWindowManager.setLifecycleListener((event) => this.recordTuiLifecycleEvent(event));
+    this.startupRecovery = this.recoverInterruptedQueue()
+      .then(() => this.tuiWindowManager.start())
+      .catch(async (error: unknown) => {
+        await this.logger
+          .append("runtime", "startup", {
+            type: "runtime_dependent_recovery_failed",
+            error: error instanceof Error ? error.message : String(error),
+          })
+          .catch(() => undefined);
+        throw error;
+      });
     return this.startupRecovery;
   }
 
@@ -215,6 +237,7 @@ export class TaskService {
     this.attentionWaiters.clear();
     this.threadContexts.clear();
     this.turnContexts.clear();
+    this.tuiWindowManager.setLifecycleListener(null);
     this.tuiWindowManager.stop();
   }
 
@@ -232,12 +255,64 @@ export class TaskService {
   }
 
   async openTask(input: TaskOpenInput): Promise<TaskOpenResult> {
+    if (input.orchestrator) {
+      const key = `orchestrator:${input.orchestrator.kind}:${input.orchestrator.sessionId}`;
+      return this.queue.runExclusive(key, () => this.openTaskForSession(input));
+    }
+    return this.openTaskForSession(input);
+  }
+
+  private async openTaskForSession(originalInput: TaskOpenInput): Promise<TaskOpenResult> {
+    let input = originalInput;
+    if (input.mode === "new" && input.expectedTaskId) {
+      throw new Error("expectedTaskId is only valid with task_open mode=reuse.");
+    }
+    if (input.orchestrator) {
+      const canonical = canonicalizeProjectRoot(input.projectRoot);
+      const binding = this.store.getOrchestratorBinding(input.orchestrator);
+      if (binding) {
+        if (binding.status !== "ACTIVE") {
+          throw new Error(
+            `Orchestrator session ${input.orchestrator.kind}:${input.orchestrator.sessionId} is ${binding.status} and cannot open another Codex session.`,
+          );
+        }
+        if (binding.projectKey !== canonical.projectKey) {
+          throw new Error(
+            `Orchestrator session ${input.orchestrator.kind}:${input.orchestrator.sessionId} is already bound to task ${binding.taskId} in ${binding.projectRoot}; one orchestrator session cannot bind another project.`,
+          );
+        }
+        if (input.mode === "new") {
+          throw new Error(
+            `Orchestrator session ${input.orchestrator.kind}:${input.orchestrator.sessionId} is already bound to task ${binding.taskId}; continue that task instead of opening mode=new.`,
+          );
+        }
+        if (input.expectedTaskId && input.expectedTaskId !== binding.taskId) {
+          throw new Error(
+            `Orchestrator session ${input.orchestrator.kind}:${input.orchestrator.sessionId} is bound to task ${binding.taskId}, not expectedTaskId=${input.expectedTaskId}.`,
+          );
+        }
+        input = { ...input, mode: "reuse", expectedTaskId: binding.taskId };
+      }
+    }
     const acquisition = await this.projectSessions.acquire(input.projectRoot, input.mode ?? "reuse");
     if (acquisition.outcome === "reuse") {
-      return this.reuseProjectSession(acquisition);
+      return this.reuseProjectSession(acquisition, input);
+    }
+    if (input.expectedTaskId) {
+      this.projectSessions.fail(acquisition);
+      throw new Error(
+        `Project session reuse rejected: expectedTaskId=${input.expectedTaskId} is not the active task for this project; use task_list or task_recover to locate that task, or omit expectedTaskId only when creating a new task.`,
+      );
     }
 
     try {
+      const taskId = createTaskId(acquisition.canonical.projectRoot, input.title);
+      const taskContract = {
+        taskId,
+        title: input.title,
+        requirements: input.requirements,
+        acceptanceCriteria: input.acceptanceCriteria,
+      };
       const runtime = await this.runtimeHostManager.ensureRuntimeHost(
         acquisition.canonical.projectRoot,
       );
@@ -245,7 +320,7 @@ export class TaskService {
       this.attachRuntimeEvents(runtime, client);
       const threadId = await client.threadStart({
         cwd: acquisition.canonical.projectRoot,
-        developerInstructions: buildCodexDeveloperInstructions(),
+        developerInstructions: buildCodexDeveloperInstructions(taskContract),
       });
       await client.setThreadName(threadId, input.title).catch(async (error: unknown) => {
         await this.logger.append("runtime", runtime.id, {
@@ -258,7 +333,7 @@ export class TaskService {
 
       const now = nowIso();
       const task: TaskRecord = {
-        id: createTaskId(acquisition.canonical.projectRoot, input.title),
+        id: taskId,
         title: input.title,
         projectRoot: acquisition.canonical.projectRoot,
         runtimeHostId: runtime.id,
@@ -271,7 +346,7 @@ export class TaskService {
         createdAt: now,
         updatedAt: now,
       };
-      const session = this.projectSessions.complete(acquisition, task);
+      const session = this.projectSessions.complete(acquisition, task, input.orchestrator);
       await this.writeTaskContract(task);
       this.registerTaskContext(task);
       const codexTui = await this.launchTuiForTask(task, runtime, session, true);
@@ -288,11 +363,14 @@ export class TaskService {
           codexThreadId: threadId,
           projectSessionId: session.id,
           sessionGeneration: session.generation,
+          orchestratorBinding: this.bindingSummary(
+            this.store.getOrchestratorBindingByTaskId(task.id),
+          ),
         },
       });
       await this.logger.append("tasks", task.id, event);
 
-      return this.toTaskOpenResult(task, runtime, session, codexTui, "opened");
+      return this.toTaskOpenResult(task, runtime, session, codexTui, "opened", input.title);
     } catch (error) {
       this.projectSessions.fail(acquisition);
       throw error;
@@ -322,7 +400,7 @@ export class TaskService {
       this.store.activateProjectSessionForTask(task);
     if (activeSession.activeTaskId !== task.id) {
       throw new Error(
-        `taskId is not the active project session: ${task.id}; call task_open with mode=reuse to obtain the current taskId.`,
+        `taskId is not the active project session: ${task.id}; the active taskId is ${activeSession.activeTaskId}. Use task_list to inspect project tasks, then call task_open with mode=reuse and expectedTaskId set to the task you intend to continue.`,
       );
     }
     const commandId = createId("queue");
@@ -342,9 +420,9 @@ export class TaskService {
         await client.ensureThreadReady(
           task.codexThreadId,
           task.projectRoot,
-          buildCodexDeveloperInstructions(),
+          buildCodexDeveloperInstructions(this.taskContract(task)),
         );
-        this.assertTuiRunning(task, runtime, activeSession);
+        await this.launchTuiForTask(task, runtime, activeSession, true, "task_send");
 
         const codexTurnId = await client.turnStart({
           threadId: task.codexThreadId,
@@ -525,6 +603,13 @@ export class TaskService {
   async status(taskId: string, options: TaskStatusOptions = {}): Promise<Record<string, unknown>> {
     const task = this.mustGetTask(taskId);
     const runtime = this.store.getRuntime(task.runtimeHostId);
+    const projectSession = this.store.getProjectSessionByKey(
+      canonicalizeProjectRoot(task.projectRoot).projectKey,
+    );
+    const activeProjectSession = projectSession?.activeTaskId === task.id ? projectSession : null;
+    const tuiInstance = activeProjectSession
+      ? this.store.getTuiInstance(activeProjectSession.id)
+      : null;
     const latestTurn = this.store.getLatestTurn(task.id);
     const pendingApproval = this.store.getPendingApproval(task.id);
     const contextUsage = this.store.getContextUsage(task.id);
@@ -533,6 +618,9 @@ export class TaskService {
       taskId: task.id,
       title: task.title,
       status: task.status,
+      orchestratorBinding: this.bindingSummary(
+        this.store.getOrchestratorBindingByTaskId(task.id),
+      ),
       runtime: runtime
         ? {
             status: runtime.status,
@@ -556,6 +644,18 @@ export class TaskService {
                 updatedAt: latestTurn.updatedAt,
               }
             : null,
+      },
+      codexTui: {
+        mode: this.bridgeConfig.codexTuiMode,
+        autoRelaunch: this.bridgeConfig.codexTuiAutoRelaunch,
+        projectSessionId: activeProjectSession?.id ?? null,
+        sessionGeneration: activeProjectSession?.generation ?? null,
+        status: tuiInstance?.status ?? (this.bridgeConfig.codexTuiMode === "off" ? "OFF" : null),
+        pid: tuiInstance?.pid ?? null,
+        restartAttempts: tuiInstance?.restartAttempts ?? 0,
+        nextRestartAt: tuiInstance?.nextRestartAt ?? null,
+        lastExitAt: tuiInstance?.lastExitAt ?? null,
+        lastError: tuiInstance?.lastError ?? null,
       },
       pendingAttention,
       context: contextUsage
@@ -626,6 +726,11 @@ export class TaskService {
       status: string;
       runtimeHostId: string;
       codexThreadId: string;
+      orchestratorBinding: {
+        id: string;
+        kind: string;
+        sessionId: string;
+      } | null;
       createdAt: string;
       updatedAt: string;
     }>;
@@ -645,6 +750,9 @@ export class TaskService {
         status: task.status,
         runtimeHostId: task.runtimeHostId,
         codexThreadId: task.codexThreadId,
+        orchestratorBinding: this.bindingSummary(
+          this.store.getOrchestratorBindingByTaskId(task.id),
+        ),
         createdAt: task.createdAt,
         updatedAt: task.updatedAt,
       })),
@@ -760,6 +868,7 @@ export class TaskService {
 
   private async reuseProjectSession(
     acquisition: ProjectSessionAcquisition,
+    input: TaskOpenInput,
   ): Promise<TaskOpenResult> {
     const session = acquisition.session;
     if (!session.activeTaskId || !session.codexThreadId) {
@@ -769,13 +878,17 @@ export class TaskService {
     if (!task || task.codexThreadId !== session.codexThreadId) {
       throw new Error(`Active project session references an invalid task: ${session.id}`);
     }
+    this.assertProjectSessionReuseAllowed(input, task);
+    const orchestratorBinding = input.orchestrator
+      ? this.store.bindOrchestratorSession({ identity: input.orchestrator, task })
+      : this.store.getOrchestratorBindingByTaskId(task.id);
     const runtime = await this.runtimeHostManager.ensureExistingRuntime(task.runtimeHostId);
     const client = await this.clientPool.getOrConnect(runtime.endpoint);
     this.bindTaskRuntimeEvents(task, runtime, client);
     await client.ensureThreadReady(
       task.codexThreadId,
       task.projectRoot,
-      buildCodexDeveloperInstructions(),
+      buildCodexDeveloperInstructions(this.taskContract(task)),
     );
     this.store.updateProjectSessionRuntime(session.id, runtime.id);
     const refreshedSession = this.store.getProjectSessionById(session.id) ?? {
@@ -796,10 +909,98 @@ export class TaskService {
         sessionGeneration: refreshedSession.generation,
         runtimeEndpoint: runtime.endpoint,
         codexThreadId: task.codexThreadId,
+        title: task.title,
+        requestedTitle: input.title,
+        expectedTaskId: input.expectedTaskId,
+        orchestratorBinding: this.bindingSummary(orchestratorBinding),
       },
     });
     await this.logger.append("tasks", task.id, event);
-    return this.toTaskOpenResult(task, runtime, refreshedSession, codexTui, "reused");
+    return this.toTaskOpenResult(
+      task,
+      runtime,
+      refreshedSession,
+      codexTui,
+      "reused",
+      input.title,
+    );
+  }
+
+  private assertProjectSessionReuseAllowed(input: TaskOpenInput, task: TaskRecord): void {
+    if (input.orchestrator) {
+      const identityBinding = this.store.getOrchestratorBinding(input.orchestrator);
+      if (identityBinding && identityBinding.taskId !== task.id) {
+        throw new Error(
+          `Orchestrator session ${input.orchestrator.kind}:${input.orchestrator.sessionId} remains bound to task ${identityBinding.taskId}, but this project's active task is ${task.id}. Call task_recover with taskId=${identityBinding.taskId} to explicitly restore the bound Codex session.`,
+        );
+      }
+      const taskBinding = this.store.getOrchestratorBindingByTaskId(task.id);
+      if (taskBinding) {
+        if (
+          taskBinding.kind === input.orchestrator.kind &&
+          taskBinding.sessionId === input.orchestrator.sessionId
+        ) {
+          return;
+        }
+        throw new Error(
+          `Project session reuse rejected: active task ${task.id} belongs to orchestrator session ${taskBinding.kind}:${taskBinding.sessionId}, not ${input.orchestrator.kind}:${input.orchestrator.sessionId}. Use mode=new only for an explicit project-session replacement.`,
+        );
+      }
+      if (input.expectedTaskId === task.id) {
+        return;
+      }
+      throw new Error(
+        `Project session reuse rejected: orchestrator session ${input.orchestrator.kind}:${input.orchestrator.sessionId} is not bound yet, and activeTaskId=${task.id}. Pass expectedTaskId=${task.id} only to adopt this legacy unbound task, or use mode=new for an independent Codex session.`,
+      );
+    }
+
+    const taskBinding = this.store.getOrchestratorBindingByTaskId(task.id);
+    if (taskBinding && !input.expectedTaskId) {
+      throw new Error(
+        `Project session reuse rejected: active task ${task.id} is bound to orchestrator session ${taskBinding.kind}:${taskBinding.sessionId}. Pass that stable orchestrator identity, or use expectedTaskId=${task.id} only from a legacy client that already knows the task.`,
+      );
+    }
+
+    if (input.expectedTaskId) {
+      if (input.expectedTaskId === task.id) {
+        return;
+      }
+      throw new Error(
+        `Project session reuse rejected: expectedTaskId=${input.expectedTaskId} does not match activeTaskId=${task.id} (${JSON.stringify(task.title)}). Use expectedTaskId=${task.id} to continue the active task or mode=new for independent work.`,
+      );
+    }
+
+    const sameContract =
+      input.title === task.title &&
+      isDeepStrictEqual(input.requirements ?? null, task.requirements ?? null) &&
+      isDeepStrictEqual(input.acceptanceCriteria, task.acceptanceCriteria) &&
+      (input.tokenBudget ?? null) === task.tokenBudget;
+    if (sameContract) {
+      return;
+    }
+
+    throw new Error(
+      `Project session reuse requires explicit task identity: activeTaskId=${task.id}, activeTitle=${JSON.stringify(task.title)}, requestedTitle=${JSON.stringify(input.title)}. Retry with expectedTaskId=${task.id} only to continue that task, or use mode=new for independent work.`,
+    );
+  }
+
+  private taskContract(task: TaskRecord): CodexTaskContract {
+    return {
+      taskId: task.id,
+      title: task.title,
+      requirements: task.requirements,
+      acceptanceCriteria: task.acceptanceCriteria,
+    };
+  }
+
+  private bindingSummary(binding: OrchestratorSessionBindingRecord | null): {
+    id: string;
+    kind: string;
+    sessionId: string;
+  } | null {
+    return binding
+      ? { id: binding.id, kind: binding.kind, sessionId: binding.sessionId }
+      : null;
   }
 
   private async writeTaskContract(task: TaskRecord): Promise<void> {
@@ -853,6 +1054,7 @@ export class TaskService {
     session: ProjectSessionRecord,
     codexTui: CodexTuiWindowResult,
     status: "opened" | "reused",
+    requestedTitle: string,
   ): TaskOpenResult {
     const latestTurn = this.store.getLatestTurn(task.id);
     const pendingAttention = this.getPendingAttention(task.id);
@@ -877,6 +1079,13 @@ export class TaskService {
       codexThreadId: task.codexThreadId,
       projectSessionId: session.id,
       sessionGeneration: session.generation,
+      title: task.title,
+      requestedTitle,
+      taskCreatedAt: task.createdAt,
+      taskUpdatedAt: task.updatedAt,
+      orchestratorBinding: this.bindingSummary(
+        this.store.getOrchestratorBindingByTaskId(task.id),
+      ),
       codexTui: {
         launched: codexTui.launched,
         mode: codexTui.mode,
@@ -938,6 +1147,7 @@ export class TaskService {
     runtime: RuntimeHostRecord,
     session: ProjectSessionRecord,
     required = false,
+    trigger: TuiEnsureTrigger = "task_open",
   ): Promise<{
     launched: boolean;
     mode: "off" | "remote" | "resume";
@@ -954,24 +1164,35 @@ export class TaskService {
           endpoint: runtime.endpoint,
           threadId: task.codexThreadId,
         },
+        { trigger },
       );
       if (required && result.mode !== "off" && result.pid === null) {
         throw new Error("Codex TUI launcher did not return a process id.");
       }
+      if (trigger === "task_send" && !result.launched) {
+        return result;
+      }
+      const eventType =
+        result.launched && trigger === "task_send"
+          ? "codex_tui_window_relaunched"
+          : result.launched
+            ? "codex_tui_window_launched"
+            : "codex_tui_window_skipped";
       const event = this.store.appendEvent({
         taskId: task.id,
         runtimeHostId: runtime.id,
         codexThreadId: task.codexThreadId,
         codexTurnId: null,
-        eventType: result.launched ? "codex_tui_window_launched" : "codex_tui_window_skipped",
+        eventType,
         payload: {
-          type: result.launched ? "codex_tui_window_launched" : "codex_tui_window_skipped",
+          type: eventType,
           mode: result.mode,
           pid: result.pid,
           scriptPath: result.scriptPath,
           reason: result.reason,
           projectSessionId: session.id,
           sessionGeneration: session.generation,
+          trigger,
         },
       });
       await this.logger.append("tasks", task.id, event);
@@ -1002,24 +1223,21 @@ export class TaskService {
     }
   }
 
-  private assertTuiRunning(
-    task: TaskRecord,
-    runtime: RuntimeHostRecord,
-    session: ProjectSessionRecord,
-  ): void {
-    const result = this.tuiWindowManager.getRunning({
-      sessionId: session.id,
-      sessionGeneration: session.generation,
-      runtimeId: runtime.id,
-      projectRoot: task.projectRoot,
-      endpoint: runtime.endpoint,
-      threadId: task.codexThreadId,
+  private async recordTuiLifecycleEvent(event: TuiLifecycleEvent): Promise<void> {
+    const persisted = this.store.appendEvent({
+      taskId: event.taskId,
+      runtimeHostId: event.runtimeHostId,
+      codexThreadId: event.codexThreadId,
+      codexTurnId: event.codexTurnId,
+      eventType: event.type,
+      payload: {
+        type: event.type,
+        projectSessionId: event.projectSessionId,
+        sessionGeneration: event.sessionGeneration,
+        ...event.payload,
+      },
     });
-    if (result.mode !== "off" && result.pid === null) {
-      throw new Error(
-        "Codex TUI is not running for this project session; call task_open with mode=reuse to restore the visible session before task_send.",
-      );
-    }
+    await this.logger.append("tasks", event.taskId, persisted);
   }
 
   private async handleServerRequest(
@@ -1487,7 +1705,7 @@ export class TaskService {
     await client.ensureThreadReady(
       task.codexThreadId,
       task.projectRoot,
-      buildCodexDeveloperInstructions(),
+      buildCodexDeveloperInstructions(this.taskContract(task)),
     );
     const thread = await client.readThread(task.codexThreadId);
     const remoteTurn = thread.turns.find((turn) => turn.id === localTurn.codexTurnId);
@@ -1632,6 +1850,18 @@ function summarizeMessage(eventType: string, payload: Record<string, unknown>): 
       return "Codex remote TUI window was skipped.";
     case "codex_tui_window_failed":
       return "Codex remote TUI window failed to launch.";
+    case "codex_tui_window_exited":
+      return "Codex remote TUI window exited.";
+    case "codex_tui_relaunch_scheduled":
+      return "Codex remote TUI window relaunch was scheduled.";
+    case "codex_tui_window_relaunched":
+      return "Codex remote TUI window was relaunched on the existing task thread.";
+    case "codex_tui_relaunch_failed":
+      return "Codex remote TUI window relaunch failed.";
+    case "codex_tui_relaunch_suppressed":
+      return "Codex remote TUI window relaunch was suppressed by policy.";
+    case "codex_tui_relaunch_circuit_opened":
+      return "Codex remote TUI window relaunch circuit opened after repeated exits.";
     default:
       return eventType.replace(/^codex_/, "Codex event: ");
   }
@@ -1680,9 +1910,26 @@ function summarizeDetails(
   if (
     eventType === "codex_tui_window_launched" ||
     eventType === "codex_tui_window_skipped" ||
-    eventType === "codex_tui_window_failed"
+    eventType === "codex_tui_window_failed" ||
+    eventType === "codex_tui_window_exited" ||
+    eventType === "codex_tui_relaunch_scheduled" ||
+    eventType === "codex_tui_window_relaunched" ||
+    eventType === "codex_tui_relaunch_failed" ||
+    eventType === "codex_tui_relaunch_suppressed" ||
+    eventType === "codex_tui_relaunch_circuit_opened"
   ) {
-    return pick(payload, ["mode", "pid", "scriptPath", "reason"]);
+    return pick(payload, [
+      "mode",
+      "pid",
+      "scriptPath",
+      "reason",
+      "trigger",
+      "restartAttempts",
+      "delayMs",
+      "nextRestartAt",
+      "projectSessionId",
+      "sessionGeneration",
+    ]);
   }
   return pick(payload, ["codexTurnId", "runtimeEndpoint", "codexThreadId"]);
 }

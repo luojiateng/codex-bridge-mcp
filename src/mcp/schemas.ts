@@ -1,5 +1,19 @@
 import { z } from "zod";
 
+export const OrchestratorIdentitySchema = z.object({
+  kind: z
+    .enum(["claude", "codex", "cursor", "other"])
+    .describe("The task-orchestrator application that owns this conversation."),
+  sessionId: z
+    .string()
+    .trim()
+    .min(1)
+    .max(256)
+    .describe(
+      "Stable application-level conversation identifier. Reuse it for every task_open in this conversation; never use a per-call MCP transport session id.",
+    ),
+}).describe("Stable task-orchestrator conversation identity for one-to-one Codex binding.");
+
 export const TaskOpenSchema = z.object({
   projectRoot: z.string().min(1),
   title: z.string().min(1),
@@ -7,6 +21,8 @@ export const TaskOpenSchema = z.object({
   acceptanceCriteria: z.array(z.string()).default([]),
   tokenBudget: z.number().int().positive().optional(),
   mode: z.enum(["reuse", "new"]).default("reuse"),
+  expectedTaskId: z.string().min(1).optional(),
+  orchestrator: OrchestratorIdentitySchema.optional(),
 });
 
 export const TaskSendSchema = z.object({

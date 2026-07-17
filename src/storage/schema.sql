@@ -37,6 +37,11 @@ create table if not exists tui_instance (
   status text not null,
   claim_token text,
   claim_expires_at text,
+  restart_attempts integer not null default 0,
+  restart_window_started_at text,
+  next_restart_at text,
+  last_exit_at text,
+  last_error text,
   created_at text not null,
   updated_at text not null
 );
@@ -55,6 +60,21 @@ create table if not exists task (
   created_at text not null,
   updated_at text not null,
   unique(id, codex_thread_id)
+);
+
+create table if not exists orchestrator_session_binding (
+  id text primary key,
+  orchestrator_kind text not null,
+  orchestrator_session_id text not null,
+  task_id text not null unique,
+  codex_thread_id text not null unique,
+  project_key text not null,
+  project_root text not null,
+  status text not null,
+  created_at text not null,
+  last_seen_at text not null,
+  closed_at text,
+  unique(orchestrator_kind, orchestrator_session_id)
 );
 
 create table if not exists task_command_queue (
@@ -138,3 +158,5 @@ create index if not exists idx_approval_task_decision on approval(task_id, decis
 create index if not exists idx_turn_task_created on turn(task_id, created_at);
 create index if not exists idx_project_session_runtime on project_session(runtime_host_id, status);
 create index if not exists idx_tui_instance_endpoint on tui_instance(runtime_endpoint, status);
+create index if not exists idx_orchestrator_binding_project
+  on orchestrator_session_binding(project_key, status);

@@ -5,6 +5,7 @@ import {
   type CanonicalProjectRoot,
 } from "../shared/projectRoot.js";
 import {
+  type OrchestratorSessionIdentity,
   type ProjectSessionRecord,
   type TaskRecord,
   SqliteStore,
@@ -67,6 +68,7 @@ export class ProjectSessionCoordinator {
   complete(
     acquisition: ProjectSessionAcquisition,
     task: TaskRecord,
+    orchestrator?: OrchestratorSessionIdentity,
   ): ProjectSessionRecord {
     if (!acquisition.claimToken) {
       throw new Error(`Cannot complete an unclaimed project session: ${acquisition.session.id}`);
@@ -75,6 +77,7 @@ export class ProjectSessionCoordinator {
       sessionId: acquisition.session.id,
       claimToken: acquisition.claimToken,
       task,
+      orchestrator,
     });
   }
 

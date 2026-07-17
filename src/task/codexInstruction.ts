@@ -2,8 +2,15 @@ export interface CodexInstructionOptions {
   runChecks: boolean;
 }
 
-export function buildCodexDeveloperInstructions(): string {
-  return [
+export interface CodexTaskContract {
+  taskId: string;
+  title: string;
+  requirements: unknown;
+  acceptanceCriteria: unknown[];
+}
+
+export function buildCodexDeveloperInstructions(taskContract?: CodexTaskContract): string {
+  const instructions = [
     "You are the execution engine. The task orchestrator is the task brain.",
     "",
     "Rules:",
@@ -19,6 +26,28 @@ export function buildCodexDeveloperInstructions(): string {
     "10. Keep tool output economical: use focused searches, inspect summaries before full files, avoid duplicate reads, and run the smallest relevant check.",
     "11. Do not print or repeat full logs, diffs, generated files, or command output unless the task specifically needs them; retain only decisive lines and failures.",
     "12. End every turn with one concise final message containing only: changes, files, tests, and unfinished items.",
+    "13. Treat this thread's durable task contract as authoritative. Do not replace missing or ambiguous details with unrelated memory or project history; stop and report the ambiguity instead.",
+  ];
+  if (!taskContract) {
+    return instructions.join("\n");
+  }
+  const acceptanceCriteria =
+    taskContract.acceptanceCriteria.length > 0
+      ? taskContract.acceptanceCriteria
+          .map((criterion) => `- ${renderContractValue(criterion)}`)
+          .join("\n")
+      : "- None specified.";
+  return [
+    ...instructions,
+    "",
+    "Authoritative durable task contract for this thread:",
+    `Task ID: ${taskContract.taskId}`,
+    `Title: ${taskContract.title}`,
+    "Requirements:",
+    renderContractValue(taskContract.requirements),
+    "Acceptance criteria:",
+    acceptanceCriteria,
+    "The current turn may refine this contract, but unrelated memory or project history must not redefine it.",
   ].join("\n");
 }
 
@@ -27,11 +56,21 @@ export function buildCodexInstruction(
   options: CodexInstructionOptions,
 ): string {
   return [
-    "Task orchestrator instruction:",
+    "Current task orchestrator instruction:",
     instruction,
     "",
     options.runChecks
       ? "Checks: run the most relevant lightweight check after editing."
       : "Checks: do not run verification commands for this turn unless the instruction itself explicitly requires them. Report tests as not run when skipped.",
   ].join("\n");
+}
+
+function renderContractValue(value: unknown): string {
+  if (value === null || value === undefined) {
+    return "None specified.";
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  return JSON.stringify(value, null, 2) ?? String(value);
 }
