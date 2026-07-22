@@ -293,6 +293,10 @@ const generatedTuiScript = await fs.readFile(
 assert.match(generatedTuiScript, /while \(\$true\)/);
 assert.match(generatedTuiScript, /Add-Content -LiteralPath \$TuiLogPath/);
 assert.match(generatedTuiScript, /Attempt \$\(\$attempt\):/);
+assert.match(
+  generatedTuiScript,
+  /Set-Content -LiteralPath '.*\.tui\.pid' -Value \$PID -Encoding ASCII -ErrorAction Stop/,
+);
 
 const restarted = createServices();
 await restarted.taskService.waitForStartupRecovery();

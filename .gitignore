@@ -4,6 +4,7 @@ data/bridge.db
 data/bridge.db-*
 data/runtime-scripts/*.ps1
 data/runtime-scripts/*.log
+data/runtime-scripts/*.pid
 data/logs/
 data/mcp-token
 data/build-check/

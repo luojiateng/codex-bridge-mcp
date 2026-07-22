@@ -1,9 +1,11 @@
 import { spawn, spawnSync } from "node:child_process";
+import fs from "node:fs/promises";
+import path from "node:path";
 import { config, type BridgeConfig } from "../config/config.js";
 import { createId, nowIso } from "../shared/id.js";
 import { SqliteStore } from "../storage/sqlite.js";
 import { delay } from "./heartbeat.js";
-import { writeCodexTuiScript } from "./powershellScriptBuilder.js";
+import { getCodexTuiPidPath, writeCodexTuiScript } from "./powershellScriptBuilder.js";
 
 export interface CodexTuiWindowInput {
   runtimeId: string;
@@ -670,16 +672,38 @@ export function terminateOwnedProcess(pid: number): void {
 }
 
 const TUI_POWERSHELL_EXECUTABLES = ["pwsh.exe", "powershell.exe"] as const;
+const WINDOWS_TERMINAL_PID_TIMEOUT_MS = 10_000;
+const WINDOWS_TERMINAL_PID_POLL_MS = 50;
 
 async function launchVisiblePowerShellScript(
   scriptPath: string,
   projectRoot: string,
 ): Promise<number | null> {
+  const windowsTerminal = await resolveWindowsTerminalExecutable();
+  const powershell = await resolvePowerShellExecutable();
+  if (windowsTerminal && powershell) {
+    const pidPath = getCodexTuiPidPath(scriptPath);
+    await fs.rm(pidPath, { force: true });
+    try {
+      return await launchWindowsTerminalTab(
+        windowsTerminal,
+        powershell,
+        scriptPath,
+        pidPath,
+        projectRoot,
+      );
+    } catch (error) {
+      if (!isWindowsTerminalUnavailableError(error)) {
+        throw error;
+      }
+    }
+  }
+
   for (const executable of TUI_POWERSHELL_EXECUTABLES) {
     try {
       return await launchVisiblePowerShellScriptWith(executable, scriptPath, projectRoot);
     } catch (error) {
-      if (!isExecutableNotFoundError(error)) {
+      if (!isNotFoundError(error)) {
         throw error;
       }
     }
@@ -687,6 +711,115 @@ async function launchVisiblePowerShellScript(
 
   throw new Error(
     `Codex TUI launcher failed: none of ${TUI_POWERSHELL_EXECUTABLES.join(", ")} is available.`,
+  );
+}
+
+async function resolveWindowsTerminalExecutable(): Promise<string | null> {
+  const localAppData = process.env.LOCALAPPDATA;
+  if (localAppData) {
+    const appExecutionAlias = path.join(localAppData, "Microsoft", "WindowsApps", "wt.exe");
+    try {
+      await fs.access(appExecutionAlias);
+      return appExecutionAlias;
+    } catch {
+      // Fall through to PATH lookup for unpackaged Windows Terminal installations.
+    }
+  }
+  return findExecutableOnPath("wt.exe");
+}
+
+async function findExecutableOnPath(executable: string): Promise<string | null> {
+  for (const directory of (process.env.PATH ?? "").split(path.delimiter)) {
+    const normalizedDirectory = directory.trim().replace(/^"|"$/g, "");
+    if (!normalizedDirectory) {
+      continue;
+    }
+    const candidate = path.join(normalizedDirectory, executable);
+    try {
+      await fs.access(candidate);
+      return candidate;
+    } catch {
+      // Continue through the process PATH.
+    }
+  }
+  return null;
+}
+
+async function resolvePowerShellExecutable(): Promise<string | null> {
+  for (const candidate of TUI_POWERSHELL_EXECUTABLES) {
+    const resolved = await findExecutableOnPath(candidate);
+    if (resolved) {
+      return resolved;
+    }
+  }
+  return null;
+}
+
+function launchWindowsTerminalTab(
+  windowsTerminal: string,
+  powershell: string,
+  scriptPath: string,
+  pidPath: string,
+  projectRoot: string,
+): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const launcher = spawn(
+      windowsTerminal,
+      [
+        "-w",
+        "0",
+        "new-tab",
+        "--startingDirectory",
+        projectRoot,
+        powershell,
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        `& ${psString(scriptPath)}`,
+      ],
+      {
+        cwd: projectRoot,
+        windowsHide: true,
+        stdio: ["ignore", "ignore", "pipe"],
+      },
+    );
+    let stderr = "";
+    launcher.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+    launcher.once("error", reject);
+    launcher.once("exit", (code, signal) => {
+      if (code !== 0) {
+        reject(
+          new Error(
+            `Windows Terminal TUI launcher failed: code=${String(code)} signal=${String(signal)} stderr=${stderr.trim()}`,
+          ),
+        );
+      }
+    });
+    void waitForTuiPid(pidPath).then(resolve, reject);
+  });
+}
+
+async function waitForTuiPid(pidPath: string): Promise<number> {
+  const deadline = Date.now() + WINDOWS_TERMINAL_PID_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    try {
+      const value = (await fs.readFile(pidPath, "utf8")).trim();
+      const pid = Number(value);
+      if (Number.isInteger(pid) && pid > 0) {
+        return pid;
+      }
+    } catch (error) {
+      if (!isNotFoundError(error)) {
+        throw error;
+      }
+    }
+    await delay(WINDOWS_TERMINAL_PID_POLL_MS);
+  }
+  throw new Error(
+    `Windows Terminal TUI did not report its process id within ${WINDOWS_TERMINAL_PID_TIMEOUT_MS}ms: ${pidPath}`,
   );
 }
 
@@ -738,8 +871,13 @@ function launchVisiblePowerShellScriptWith(
   });
 }
 
-function isExecutableNotFoundError(error: unknown): boolean {
+function isNotFoundError(error: unknown): boolean {
   return (error as NodeJS.ErrnoException | null)?.code === "ENOENT";
+}
+
+function isWindowsTerminalUnavailableError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  return code === "ENOENT" || code === "EACCES" || code === "EPERM";
 }
 
 function psString(value: string): string {
