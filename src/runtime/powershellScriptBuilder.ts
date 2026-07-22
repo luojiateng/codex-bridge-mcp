@@ -65,6 +65,7 @@ export async function writeCodexTuiScript(input: CodexTuiScriptInput): Promise<s
     input.runtimeScriptsDir,
     `${input.runtimeId}-${input.threadId}.tui.ps1`,
   );
+  const pidPath = getCodexTuiPidPath(scriptPath);
   const logPath = path.join(
     input.runtimeScriptsDir,
     `${input.runtimeId}-${input.threadId}.tui.log`,
@@ -83,6 +84,7 @@ export async function writeCodexTuiScript(input: CodexTuiScriptInput): Promise<s
       : ["--remote", input.endpoint, "--cd", input.projectRoot];
   const content = [
     `$ErrorActionPreference = "Continue"`,
+    `Set-Content -LiteralPath ${psString(pidPath)} -Value $PID -Encoding ASCII -ErrorAction Stop`,
     `try { $Host.UI.RawUI.WindowTitle = ${psString(title)} } catch {}`,
     `Set-Location -LiteralPath ${psString(input.projectRoot)}`,
     `$TuiLogPath = ${psString(logPath)}`,
@@ -132,6 +134,11 @@ export async function writeCodexTuiScript(input: CodexTuiScriptInput): Promise<s
   ].join("\r\n");
   await fs.writeFile(scriptPath, content, "utf8");
   return scriptPath;
+}
+
+export function getCodexTuiPidPath(scriptPath: string): string {
+  const extension = path.extname(scriptPath);
+  return path.join(path.dirname(scriptPath), `${path.basename(scriptPath, extension)}.pid`);
 }
 
 function psString(value: string): string {
