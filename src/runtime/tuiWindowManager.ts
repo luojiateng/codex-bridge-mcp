@@ -1,11 +1,16 @@
 import { spawn, spawnSync } from "node:child_process";
+import { closeSync, openSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { config, type BridgeConfig } from "../config/config.js";
 import { createId, nowIso } from "../shared/id.js";
 import { SqliteStore } from "../storage/sqlite.js";
 import { delay } from "./heartbeat.js";
-import { getCodexTuiPidPath, writeCodexTuiScript } from "./powershellScriptBuilder.js";
+import {
+  getCodexTuiLeasePath,
+  getCodexTuiPidPath,
+  writeCodexTuiScript,
+} from "./powershellScriptBuilder.js";
 
 export interface CodexTuiWindowInput {
   runtimeId: string;
@@ -68,12 +73,12 @@ export interface TuiWindowManagerTiming {
 type LaunchScript = (scriptPath: string, projectRoot: string) => Promise<number | null>;
 
 export interface TuiProcessController {
-  isAlive(pid: number | null): boolean;
-  terminate(pid: number): void;
+  isAlive(pid: number | null, leasePath?: string): boolean;
+  terminate(pid: number, leasePath?: string): void;
 }
 
 const defaultProcessController: TuiProcessController = {
-  isAlive: isProcessAlive,
+  isAlive: isTuiProcessAlive,
   terminate: terminateOwnedProcess,
 };
 
@@ -128,7 +133,7 @@ export class TuiWindowManager {
         continue;
       }
       if (instance.status === "RUNNING") {
-        if (this.processController.isAlive(instance.pid)) {
+        if (this.processController.isAlive(instance.pid, this.leasePath(input))) {
           this.monitorProcess(input, instance.pid);
           continue;
         }
@@ -191,6 +196,7 @@ export class TuiWindowManager {
     trigger: TuiEnsureTrigger,
   ): Promise<CodexTuiWindowResult> {
     const manualRecovery = trigger === "task_open" || trigger === "task_recover";
+    const leasePath = this.leasePath(input);
     if (trigger === "task_send" && this.bridgeConfig.codexTuiAutoRelaunch === "off") {
       const running = this.getRunning(input, false);
       if (running.pid !== null) {
@@ -227,9 +233,16 @@ export class TuiWindowManager {
       }
 
       const existing = this.store.getTuiInstance(input.sessionId);
-      if (existing?.pid && this.processController.isAlive(existing.pid)) {
+      const existingLeasePath = existing
+        ? this.leasePathFor(existing.sessionId, existing.generation)
+        : undefined;
+      if (
+        existing?.pid &&
+        existingLeasePath &&
+        this.processController.isAlive(existing.pid, existingLeasePath)
+      ) {
         this.stopMonitoring(input.sessionId);
-        this.processController.terminate(existing.pid);
+        this.processController.terminate(existing.pid, existingLeasePath);
         await delay(100);
         this.store.markTuiExited(input.sessionId, existing.generation, existing.pid);
       }
@@ -256,7 +269,7 @@ export class TuiWindowManager {
           throw new Error("Codex TUI launcher did not return a process id.");
         }
         await delay(this.timing.startupGraceMs);
-        if (!this.processController.isAlive(launchedPid)) {
+        if (!this.processController.isAlive(launchedPid, leasePath)) {
           throw new Error(`Codex TUI process exited during startup: pid=${launchedPid}`);
         }
         this.store.completeTuiLaunch({
@@ -306,7 +319,7 @@ export class TuiWindowManager {
       existing.runtimeEndpoint === input.endpoint &&
       existing.codexThreadId === input.threadId;
     if (existing?.status === "RUNNING" && sameTarget) {
-      if (this.processController.isAlive(existing.pid)) {
+      if (this.processController.isAlive(existing.pid, this.leasePath(input))) {
         this.monitorProcess(input, existing.pid);
         return {
           launched: false,
@@ -352,8 +365,9 @@ export class TuiWindowManager {
     for (const instance of staleInstances) {
       this.stopMonitoring(instance.sessionId);
       this.cancelRelaunchTimer(instance.sessionId);
-      if (instance.pid && this.processController.isAlive(instance.pid)) {
-        this.processController.terminate(instance.pid);
+      const leasePath = this.leasePathFor(instance.sessionId, instance.generation);
+      if (instance.pid && this.processController.isAlive(instance.pid, leasePath)) {
+        this.processController.terminate(instance.pid, leasePath);
       }
     }
   }
@@ -362,8 +376,9 @@ export class TuiWindowManager {
     if (pid === null || this.processMonitors.has(input.sessionId)) {
       return;
     }
+    const leasePath = this.leasePath(input);
     const monitor = setInterval(() => {
-      if (this.processController.isAlive(pid)) {
+      if (this.processController.isAlive(pid, leasePath)) {
         return;
       }
       this.stopMonitoring(input.sessionId);
@@ -599,6 +614,18 @@ export class TuiWindowManager {
     return `${input.sessionId}:${input.sessionGeneration}`;
   }
 
+  private leasePath(input: ManagedCodexTuiWindowInput): string {
+    return this.leasePathFor(input.sessionId, input.sessionGeneration);
+  }
+
+  private leasePathFor(sessionId: string, sessionGeneration: number): string {
+    return getCodexTuiLeasePath(
+      this.bridgeConfig.runtimeScriptsDir,
+      sessionId,
+      sessionGeneration,
+    );
+  }
+
   private cancelRelaunchTimer(sessionId: string): void {
     for (const [key, timer] of this.relaunchTimers) {
       if (key.startsWith(`${sessionId}:`)) {
@@ -610,7 +637,7 @@ export class TuiWindowManager {
 }
 
 export async function launchCodexTuiWindow(
-  input: CodexTuiWindowInput,
+  input: ManagedCodexTuiWindowInput,
   bridgeConfig: BridgeConfig = config,
   launchScript: LaunchScript = launchVisiblePowerShellScript,
 ): Promise<CodexTuiWindowResult> {
@@ -630,6 +657,11 @@ export async function launchCodexTuiWindow(
     endpoint: input.endpoint,
     threadId: input.threadId,
     mode: bridgeConfig.codexTuiMode,
+    leasePath: getCodexTuiLeasePath(
+      bridgeConfig.runtimeScriptsDir,
+      input.sessionId,
+      input.sessionGeneration,
+    ),
   });
   const pid = await launchScript(scriptPath, input.projectRoot);
   return {
@@ -652,7 +684,31 @@ function isProcessAlive(pid: number | null): boolean {
   }
 }
 
-export function terminateOwnedProcess(pid: number): void {
+function isTuiProcessAlive(pid: number | null, leasePath?: string): boolean {
+  if (!isProcessAlive(pid)) {
+    return false;
+  }
+  if (!leasePath || process.platform !== "win32") {
+    return true;
+  }
+  return isTuiLeaseHeld(leasePath);
+}
+
+function isTuiLeaseHeld(leasePath: string): boolean {
+  try {
+    const descriptor = openSync(leasePath, "r+");
+    closeSync(descriptor);
+    return false;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    return code === "EBUSY" || code === "EACCES" || code === "EPERM";
+  }
+}
+
+export function terminateOwnedProcess(pid: number, leasePath?: string): void {
+  if (leasePath && !isTuiProcessAlive(pid, leasePath)) {
+    return;
+  }
   if (process.platform === "win32") {
     const result = spawnSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
       windowsHide: true,
