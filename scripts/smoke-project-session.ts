@@ -105,10 +105,11 @@ const config: BridgeConfig = {
 };
 
 const alivePids = new Set<number>();
+const leasePathsByPid = new Map<number, string>();
 let nextPid = 9_000;
 let tuiLaunchCount = 0;
 let tuiFailuresRemaining = 0;
-const launchTui = async (): Promise<number> => {
+const launchTui = async (scriptPath: string): Promise<number> => {
   tuiLaunchCount += 1;
   if (tuiFailuresRemaining > 0) {
     tuiFailuresRemaining -= 1;
@@ -116,12 +117,23 @@ const launchTui = async (): Promise<number> => {
   }
   const pid = nextPid++;
   alivePids.add(pid);
+  const script = await fs.readFile(scriptPath, "utf8");
+  const leasePath = script.match(/\$TuiLeasePath = '([^']+)'/)?.[1]?.replace(/''/g, "'");
+  assert(leasePath);
+  leasePathsByPid.set(pid, leasePath);
   return pid;
 };
 const processController: TuiProcessController = {
-  isAlive: (pid) => pid !== null && alivePids.has(pid),
-  terminate: (pid) => {
+  isAlive: (pid, leasePath) =>
+    pid !== null &&
+    alivePids.has(pid) &&
+    (leasePath === undefined || leasePathsByPid.get(pid) === leasePath),
+  terminate: (pid, leasePath) => {
+    if (leasePath !== undefined && leasePathsByPid.get(pid) !== leasePath) {
+      return;
+    }
     alivePids.delete(pid);
+    leasePathsByPid.delete(pid);
   },
 };
 
@@ -293,6 +305,13 @@ const generatedTuiScript = await fs.readFile(
 assert.match(generatedTuiScript, /while \(\$true\)/);
 assert.match(generatedTuiScript, /Add-Content -LiteralPath \$TuiLogPath/);
 assert.match(generatedTuiScript, /Attempt \$\(\$attempt\):/);
+assert.match(
+  generatedTuiScript,
+  /Set-Content -LiteralPath '.*\.tui\.pid' -Value \$PID -Encoding ASCII -ErrorAction Stop/,
+);
+assert.match(generatedTuiScript, /\$TuiLeasePath = '.*\.tui\.lease'/);
+assert.match(generatedTuiScript, /\[System\.IO\.FileShare\]::None/);
+assert.match(generatedTuiScript, /\$TuiLeaseStream\.Dispose\(\)/);
 
 const restarted = createServices();
 await restarted.taskService.waitForStartupRecovery();
@@ -316,10 +335,14 @@ const resumeDeveloperInstructions = String(resumeMessage?.params?.developerInstr
 assert.match(resumeDeveloperInstructions, new RegExp(`Task ID: ${first.taskId}`));
 assert.match(resumeDeveloperInstructions, /Title: Project Session Smoke/);
 
-alivePids.delete(afterRestart.codexTui.pid ?? -1);
+const reusedPid = afterRestart.codexTui.pid ?? -1;
+assert.equal(alivePids.has(reusedPid), true);
+leasePathsByPid.delete(reusedPid);
 await waitFor(
   () => restarted.store.getTuiInstance(afterRestart.projectSessionId)?.status === "EXITED",
 );
+assert.equal(alivePids.has(reusedPid), true);
+alivePids.delete(reusedPid);
 assert.equal(restarted.store.getTuiInstance(afterRestart.projectSessionId)?.status, "EXITED");
 assert.equal(tuiLaunchCount, 1);
 assert.equal(turnStartCount, 0);

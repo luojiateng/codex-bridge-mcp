@@ -1,9 +1,16 @@
 import { spawn, spawnSync } from "node:child_process";
+import { closeSync, openSync } from "node:fs";
+import fs from "node:fs/promises";
+import path from "node:path";
 import { config, type BridgeConfig } from "../config/config.js";
 import { createId, nowIso } from "../shared/id.js";
 import { SqliteStore } from "../storage/sqlite.js";
 import { delay } from "./heartbeat.js";
-import { writeCodexTuiScript } from "./powershellScriptBuilder.js";
+import {
+  getCodexTuiLeasePath,
+  getCodexTuiPidPath,
+  writeCodexTuiScript,
+} from "./powershellScriptBuilder.js";
 
 export interface CodexTuiWindowInput {
   runtimeId: string;
@@ -66,12 +73,12 @@ export interface TuiWindowManagerTiming {
 type LaunchScript = (scriptPath: string, projectRoot: string) => Promise<number | null>;
 
 export interface TuiProcessController {
-  isAlive(pid: number | null): boolean;
-  terminate(pid: number): void;
+  isAlive(pid: number | null, leasePath?: string): boolean;
+  terminate(pid: number, leasePath?: string): void;
 }
 
 const defaultProcessController: TuiProcessController = {
-  isAlive: isProcessAlive,
+  isAlive: isTuiProcessAlive,
   terminate: terminateOwnedProcess,
 };
 
@@ -126,7 +133,7 @@ export class TuiWindowManager {
         continue;
       }
       if (instance.status === "RUNNING") {
-        if (this.processController.isAlive(instance.pid)) {
+        if (this.processController.isAlive(instance.pid, this.leasePath(input))) {
           this.monitorProcess(input, instance.pid);
           continue;
         }
@@ -189,6 +196,7 @@ export class TuiWindowManager {
     trigger: TuiEnsureTrigger,
   ): Promise<CodexTuiWindowResult> {
     const manualRecovery = trigger === "task_open" || trigger === "task_recover";
+    const leasePath = this.leasePath(input);
     if (trigger === "task_send" && this.bridgeConfig.codexTuiAutoRelaunch === "off") {
       const running = this.getRunning(input, false);
       if (running.pid !== null) {
@@ -225,9 +233,16 @@ export class TuiWindowManager {
       }
 
       const existing = this.store.getTuiInstance(input.sessionId);
-      if (existing?.pid && this.processController.isAlive(existing.pid)) {
+      const existingLeasePath = existing
+        ? this.leasePathFor(existing.sessionId, existing.generation)
+        : undefined;
+      if (
+        existing?.pid &&
+        existingLeasePath &&
+        this.processController.isAlive(existing.pid, existingLeasePath)
+      ) {
         this.stopMonitoring(input.sessionId);
-        this.processController.terminate(existing.pid);
+        this.processController.terminate(existing.pid, existingLeasePath);
         await delay(100);
         this.store.markTuiExited(input.sessionId, existing.generation, existing.pid);
       }
@@ -254,7 +269,7 @@ export class TuiWindowManager {
           throw new Error("Codex TUI launcher did not return a process id.");
         }
         await delay(this.timing.startupGraceMs);
-        if (!this.processController.isAlive(launchedPid)) {
+        if (!this.processController.isAlive(launchedPid, leasePath)) {
           throw new Error(`Codex TUI process exited during startup: pid=${launchedPid}`);
         }
         this.store.completeTuiLaunch({
@@ -304,7 +319,7 @@ export class TuiWindowManager {
       existing.runtimeEndpoint === input.endpoint &&
       existing.codexThreadId === input.threadId;
     if (existing?.status === "RUNNING" && sameTarget) {
-      if (this.processController.isAlive(existing.pid)) {
+      if (this.processController.isAlive(existing.pid, this.leasePath(input))) {
         this.monitorProcess(input, existing.pid);
         return {
           launched: false,
@@ -350,8 +365,9 @@ export class TuiWindowManager {
     for (const instance of staleInstances) {
       this.stopMonitoring(instance.sessionId);
       this.cancelRelaunchTimer(instance.sessionId);
-      if (instance.pid && this.processController.isAlive(instance.pid)) {
-        this.processController.terminate(instance.pid);
+      const leasePath = this.leasePathFor(instance.sessionId, instance.generation);
+      if (instance.pid && this.processController.isAlive(instance.pid, leasePath)) {
+        this.processController.terminate(instance.pid, leasePath);
       }
     }
   }
@@ -360,8 +376,9 @@ export class TuiWindowManager {
     if (pid === null || this.processMonitors.has(input.sessionId)) {
       return;
     }
+    const leasePath = this.leasePath(input);
     const monitor = setInterval(() => {
-      if (this.processController.isAlive(pid)) {
+      if (this.processController.isAlive(pid, leasePath)) {
         return;
       }
       this.stopMonitoring(input.sessionId);
@@ -597,6 +614,18 @@ export class TuiWindowManager {
     return `${input.sessionId}:${input.sessionGeneration}`;
   }
 
+  private leasePath(input: ManagedCodexTuiWindowInput): string {
+    return this.leasePathFor(input.sessionId, input.sessionGeneration);
+  }
+
+  private leasePathFor(sessionId: string, sessionGeneration: number): string {
+    return getCodexTuiLeasePath(
+      this.bridgeConfig.runtimeScriptsDir,
+      sessionId,
+      sessionGeneration,
+    );
+  }
+
   private cancelRelaunchTimer(sessionId: string): void {
     for (const [key, timer] of this.relaunchTimers) {
       if (key.startsWith(`${sessionId}:`)) {
@@ -608,7 +637,7 @@ export class TuiWindowManager {
 }
 
 export async function launchCodexTuiWindow(
-  input: CodexTuiWindowInput,
+  input: ManagedCodexTuiWindowInput,
   bridgeConfig: BridgeConfig = config,
   launchScript: LaunchScript = launchVisiblePowerShellScript,
 ): Promise<CodexTuiWindowResult> {
@@ -628,6 +657,11 @@ export async function launchCodexTuiWindow(
     endpoint: input.endpoint,
     threadId: input.threadId,
     mode: bridgeConfig.codexTuiMode,
+    leasePath: getCodexTuiLeasePath(
+      bridgeConfig.runtimeScriptsDir,
+      input.sessionId,
+      input.sessionGeneration,
+    ),
   });
   const pid = await launchScript(scriptPath, input.projectRoot);
   return {
@@ -650,7 +684,31 @@ function isProcessAlive(pid: number | null): boolean {
   }
 }
 
-export function terminateOwnedProcess(pid: number): void {
+function isTuiProcessAlive(pid: number | null, leasePath?: string): boolean {
+  if (!isProcessAlive(pid)) {
+    return false;
+  }
+  if (!leasePath || process.platform !== "win32") {
+    return true;
+  }
+  return isTuiLeaseHeld(leasePath);
+}
+
+function isTuiLeaseHeld(leasePath: string): boolean {
+  try {
+    const descriptor = openSync(leasePath, "r+");
+    closeSync(descriptor);
+    return false;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    return code === "EBUSY" || code === "EACCES" || code === "EPERM";
+  }
+}
+
+export function terminateOwnedProcess(pid: number, leasePath?: string): void {
+  if (leasePath && !isTuiProcessAlive(pid, leasePath)) {
+    return;
+  }
   if (process.platform === "win32") {
     const result = spawnSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
       windowsHide: true,
@@ -670,16 +728,38 @@ export function terminateOwnedProcess(pid: number): void {
 }
 
 const TUI_POWERSHELL_EXECUTABLES = ["pwsh.exe", "powershell.exe"] as const;
+const WINDOWS_TERMINAL_PID_TIMEOUT_MS = 10_000;
+const WINDOWS_TERMINAL_PID_POLL_MS = 50;
 
 async function launchVisiblePowerShellScript(
   scriptPath: string,
   projectRoot: string,
 ): Promise<number | null> {
+  const windowsTerminal = await resolveWindowsTerminalExecutable();
+  const powershell = await resolvePowerShellExecutable();
+  if (windowsTerminal && powershell) {
+    const pidPath = getCodexTuiPidPath(scriptPath);
+    await fs.rm(pidPath, { force: true });
+    try {
+      return await launchWindowsTerminalTab(
+        windowsTerminal,
+        powershell,
+        scriptPath,
+        pidPath,
+        projectRoot,
+      );
+    } catch (error) {
+      if (!isWindowsTerminalUnavailableError(error)) {
+        throw error;
+      }
+    }
+  }
+
   for (const executable of TUI_POWERSHELL_EXECUTABLES) {
     try {
       return await launchVisiblePowerShellScriptWith(executable, scriptPath, projectRoot);
     } catch (error) {
-      if (!isExecutableNotFoundError(error)) {
+      if (!isNotFoundError(error)) {
         throw error;
       }
     }
@@ -687,6 +767,115 @@ async function launchVisiblePowerShellScript(
 
   throw new Error(
     `Codex TUI launcher failed: none of ${TUI_POWERSHELL_EXECUTABLES.join(", ")} is available.`,
+  );
+}
+
+async function resolveWindowsTerminalExecutable(): Promise<string | null> {
+  const localAppData = process.env.LOCALAPPDATA;
+  if (localAppData) {
+    const appExecutionAlias = path.join(localAppData, "Microsoft", "WindowsApps", "wt.exe");
+    try {
+      await fs.access(appExecutionAlias);
+      return appExecutionAlias;
+    } catch {
+      // Fall through to PATH lookup for unpackaged Windows Terminal installations.
+    }
+  }
+  return findExecutableOnPath("wt.exe");
+}
+
+async function findExecutableOnPath(executable: string): Promise<string | null> {
+  for (const directory of (process.env.PATH ?? "").split(path.delimiter)) {
+    const normalizedDirectory = directory.trim().replace(/^"|"$/g, "");
+    if (!normalizedDirectory) {
+      continue;
+    }
+    const candidate = path.join(normalizedDirectory, executable);
+    try {
+      await fs.access(candidate);
+      return candidate;
+    } catch {
+      // Continue through the process PATH.
+    }
+  }
+  return null;
+}
+
+async function resolvePowerShellExecutable(): Promise<string | null> {
+  for (const candidate of TUI_POWERSHELL_EXECUTABLES) {
+    const resolved = await findExecutableOnPath(candidate);
+    if (resolved) {
+      return resolved;
+    }
+  }
+  return null;
+}
+
+function launchWindowsTerminalTab(
+  windowsTerminal: string,
+  powershell: string,
+  scriptPath: string,
+  pidPath: string,
+  projectRoot: string,
+): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const launcher = spawn(
+      windowsTerminal,
+      [
+        "-w",
+        "0",
+        "new-tab",
+        "--startingDirectory",
+        projectRoot,
+        powershell,
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        `& ${psString(scriptPath)}`,
+      ],
+      {
+        cwd: projectRoot,
+        windowsHide: true,
+        stdio: ["ignore", "ignore", "pipe"],
+      },
+    );
+    let stderr = "";
+    launcher.stderr?.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+    launcher.once("error", reject);
+    launcher.once("exit", (code, signal) => {
+      if (code !== 0) {
+        reject(
+          new Error(
+            `Windows Terminal TUI launcher failed: code=${String(code)} signal=${String(signal)} stderr=${stderr.trim()}`,
+          ),
+        );
+      }
+    });
+    void waitForTuiPid(pidPath).then(resolve, reject);
+  });
+}
+
+async function waitForTuiPid(pidPath: string): Promise<number> {
+  const deadline = Date.now() + WINDOWS_TERMINAL_PID_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    try {
+      const value = (await fs.readFile(pidPath, "utf8")).trim();
+      const pid = Number(value);
+      if (Number.isInteger(pid) && pid > 0) {
+        return pid;
+      }
+    } catch (error) {
+      if (!isNotFoundError(error)) {
+        throw error;
+      }
+    }
+    await delay(WINDOWS_TERMINAL_PID_POLL_MS);
+  }
+  throw new Error(
+    `Windows Terminal TUI did not report its process id within ${WINDOWS_TERMINAL_PID_TIMEOUT_MS}ms: ${pidPath}`,
   );
 }
 
@@ -738,8 +927,13 @@ function launchVisiblePowerShellScriptWith(
   });
 }
 
-function isExecutableNotFoundError(error: unknown): boolean {
+function isNotFoundError(error: unknown): boolean {
   return (error as NodeJS.ErrnoException | null)?.code === "ENOENT";
+}
+
+function isWindowsTerminalUnavailableError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  return code === "ENOENT" || code === "EACCES" || code === "EPERM";
 }
 
 function psString(value: string): string {

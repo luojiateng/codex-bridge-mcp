@@ -16,6 +16,7 @@ export interface CodexTuiScriptInput {
   endpoint: string;
   threadId: string;
   mode: "remote" | "resume";
+  leasePath: string;
 }
 
 export async function writeRuntimeScript(input: RuntimeScriptInput): Promise<string> {
@@ -65,6 +66,7 @@ export async function writeCodexTuiScript(input: CodexTuiScriptInput): Promise<s
     input.runtimeScriptsDir,
     `${input.runtimeId}-${input.threadId}.tui.ps1`,
   );
+  const pidPath = getCodexTuiPidPath(scriptPath);
   const logPath = path.join(
     input.runtimeScriptsDir,
     `${input.runtimeId}-${input.threadId}.tui.log`,
@@ -82,7 +84,12 @@ export async function writeCodexTuiScript(input: CodexTuiScriptInput): Promise<s
         ]
       : ["--remote", input.endpoint, "--cd", input.projectRoot];
   const content = [
-    `$ErrorActionPreference = "Continue"`,
+    `$ErrorActionPreference = "Stop"`,
+    `$TuiLeasePath = ${psString(input.leasePath)}`,
+    `$TuiLeaseStream = [System.IO.File]::Open($TuiLeasePath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)`,
+    `try {`,
+    `  $ErrorActionPreference = "Continue"`,
+    `Set-Content -LiteralPath ${psString(pidPath)} -Value $PID -Encoding ASCII -ErrorAction Stop`,
     `try { $Host.UI.RawUI.WindowTitle = ${psString(title)} } catch {}`,
     `Set-Location -LiteralPath ${psString(input.projectRoot)}`,
     `$TuiLogPath = ${psString(logPath)}`,
@@ -128,10 +135,27 @@ export async function writeCodexTuiScript(input: CodexTuiScriptInput): Promise<s
     `  Write-TuiLog ("Codex TUI failed: " + $_.Exception.Message)`,
     `  throw`,
     `}`,
+    `} finally {`,
+    `  if ($null -ne $TuiLeaseStream) { $TuiLeaseStream.Dispose() }`,
+    `  Remove-Item -LiteralPath $TuiLeasePath -Force -ErrorAction SilentlyContinue`,
+    `}`,
     "",
   ].join("\r\n");
   await fs.writeFile(scriptPath, content, "utf8");
   return scriptPath;
+}
+
+export function getCodexTuiPidPath(scriptPath: string): string {
+  const extension = path.extname(scriptPath);
+  return path.join(path.dirname(scriptPath), `${path.basename(scriptPath, extension)}.pid`);
+}
+
+export function getCodexTuiLeasePath(
+  runtimeScriptsDir: string,
+  sessionId: string,
+  sessionGeneration: number,
+): string {
+  return path.join(runtimeScriptsDir, `${sessionId}-${sessionGeneration}.tui.lease`);
 }
 
 function psString(value: string): string {
