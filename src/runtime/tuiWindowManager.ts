@@ -669,19 +669,44 @@ export function terminateOwnedProcess(pid: number): void {
   }
 }
 
-function launchVisiblePowerShellScript(scriptPath: string, projectRoot: string): Promise<number | null> {
+const TUI_POWERSHELL_EXECUTABLES = ["pwsh.exe", "powershell.exe"] as const;
+
+async function launchVisiblePowerShellScript(
+  scriptPath: string,
+  projectRoot: string,
+): Promise<number | null> {
+  for (const executable of TUI_POWERSHELL_EXECUTABLES) {
+    try {
+      return await launchVisiblePowerShellScriptWith(executable, scriptPath, projectRoot);
+    } catch (error) {
+      if (!isExecutableNotFoundError(error)) {
+        throw error;
+      }
+    }
+  }
+
+  throw new Error(
+    `Codex TUI launcher failed: none of ${TUI_POWERSHELL_EXECUTABLES.join(", ")} is available.`,
+  );
+}
+
+function launchVisiblePowerShellScriptWith(
+  executable: (typeof TUI_POWERSHELL_EXECUTABLES)[number],
+  scriptPath: string,
+  projectRoot: string,
+): Promise<number | null> {
   const command = [
     `$ErrorActionPreference = "Stop"`,
     `$scriptPath = ${psString(scriptPath)}`,
     `$projectRoot = ${psString(projectRoot)}`,
     `$args = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $scriptPath)`,
-    `$process = Start-Process -FilePath "powershell.exe" -ArgumentList $args -WorkingDirectory $projectRoot -WindowStyle Normal -PassThru`,
+    `$process = Start-Process -FilePath ${psString(executable)} -ArgumentList $args -WorkingDirectory $projectRoot -WindowStyle Normal -PassThru`,
     `Write-Output $process.Id`,
   ].join("; ");
 
   return new Promise((resolve, reject) => {
     const launcher = spawn(
-      "powershell.exe",
+      executable,
       ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
       {
         cwd: projectRoot,
@@ -711,6 +736,10 @@ function launchVisiblePowerShellScript(scriptPath: string, projectRoot: string):
       resolve(Number.isFinite(pid) ? pid : null);
     });
   });
+}
+
+function isExecutableNotFoundError(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | null)?.code === "ENOENT";
 }
 
 function psString(value: string): string {
